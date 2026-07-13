@@ -583,26 +583,6 @@ render();
 """
 
 
-def judge_adoption(rows: list) -> tuple:
-    """README 판단 기준: TTFT p50<=1s AND 동시 5~10명 구간 사용자당 tok/s>=20 AND 에러율<=5% → 온프레미스 채택 가능"""
-    mid_rows = [r for r in rows if 5 <= r.get("concurrency", 0) <= 10]
-    ttft_ok = bool(rows) and all(r.get("p50_ttft", 999) <= 1.0 for r in rows)
-    tok_ok = bool(mid_rows) and all(r.get("avg_tok_per_sec", 0) >= 20 for r in mid_rows)
-    error_ok = bool(rows) and all(r.get("error_rate", 100) <= 5.0 for r in rows)
-
-    if ttft_ok and tok_ok and error_ok:
-        return True, "TTFT p50 1초 이하, 동시 5~10명 구간 사용자당 20 tok/s 이상, 에러율 5% 이하를 모두 충족합니다. 온프레미스 챗봇 채택이 가능한 수준입니다."
-
-    reasons = []
-    if not ttft_ok:
-        reasons.append("TTFT p50이 1초를 초과하는 구간이 있음")
-    if not tok_ok:
-        reasons.append("동시 5~10명 구간에서 사용자당 tok/s가 20 미만이거나 해당 구간 측정값이 없음")
-    if not error_ok:
-        reasons.append("에러율이 5%를 초과하는 구간이 있음")
-    return False, "기준 미달(" + ", ".join(reasons) + "). 클라우드 API(Gemini Flash 등) 유지가 ROI상 유리합니다."
-
-
 COMPARE_METRICS = [
     ("p50_ttft", "TTFT p50", True, "s"),
     ("aggregate_tok_per_sec", "전체 처리량", False, "tok/s"),
@@ -731,27 +711,9 @@ def generate_pdf_report(results_dir: str) -> str:
             ]))
             story.append(table)
 
-            ok, reason = judge_adoption(ds["rows"])
-            verdict_bg = colors.HexColor("#e9f7ee") if ok else colors.HexColor("#fbeceb")
-            verdict_table = Table(
-                [[Paragraph(f"판정: {'채택 가능' if ok else '채택 보류'} — {reason}",
-                            styles["verdict_ok"] if ok else styles["verdict_ng"])]],
-                colWidths=[269 * mm],
-            )
-            verdict_table.setStyle(TableStyle([
-                ("BACKGROUND", (0, 0), (-1, -1), verdict_bg),
-                ("LEFTPADDING", (0, 0), (-1, -1), 10),
-                ("RIGHTPADDING", (0, 0), (-1, -1), 10),
-                ("TOPPADDING", (0, 0), (-1, -1), 8),
-                ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
-            ]))
-            story.append(Spacer(1, 6 * mm))
-            story.append(verdict_table)
-
-        story.append(Paragraph("판단 기준", styles["h2"]))
+        story.append(Paragraph("참고: 측정 지표 설명", styles["h2"]))
         story.append(Paragraph(
-            "TTFT p50 1초 이하, 동시 5~10명 구간에서 사용자당 20 tok/s 이상, 에러율 5% 이하를 모두 만족하면 "
-            "온프레미스 챗봇 채택 가능. 못 미치면 클라우드 API(Gemini Flash 등) 유지가 ROI상 유리. "
+            "TTFT p50/p95는 첫 토큰 응답 시간, tok/s는 초당 생성 토큰 수. "
             "TTFT SD / tok/s SD는 표준편차로 응답 일관성(안정성)을 나타내며, 값이 클수록 응답 편차가 커 사용자 체감 품질이 불안정함을 의미함.",
             styles["body"]))
 
