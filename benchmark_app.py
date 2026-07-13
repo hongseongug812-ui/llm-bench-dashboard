@@ -282,6 +282,16 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
   .chip-pass { color: var(--good); }
   .chip-fail { color: var(--critical); }
 
+  .compare-headline { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
+  .compare-headline .crown { font-size: 20px; }
+  .compare-headline b { font-size: 16px; }
+  .compare-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+  .compare-table th, .compare-table td { padding: 9px 10px; text-align: center; border-bottom: 1px solid var(--grid); }
+  .compare-table th:first-child, .compare-table td:first-child { text-align: left; color: var(--ink-2); }
+  .compare-table th { color: var(--ink-muted); font-weight: 600; font-size: 11px; text-transform: uppercase; }
+  .win-cell { font-weight: 700; color: var(--good); }
+  .win-cell .medal { margin-right: 4px; }
+
   .charts { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
   @media (max-width: 900px) { .charts { grid-template-columns: 1fr; } .tiles { grid-template-columns: 1fr; } }
   .chart-box {
@@ -326,6 +336,8 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 <div id="runningBanner" class="running"></div>
 
 <div id="content">
+  <div id="comparePanel" class="panel" style="display:none;"></div>
+
   <div id="tiles" class="tiles"></div>
 
   <div class="charts" style="margin-bottom:18px;">
@@ -395,6 +407,7 @@ function render() {
   document.getElementById('emptyState').style.display = datasets.length ? 'none' : 'block';
   document.getElementById('content').style.display = datasets.length ? 'block' : 'none';
   if (!datasets.length) return;
+  renderComparison();
   renderTiles();
   renderChart('ttftChart', 'p50_ttft', 'TTFT (s)');
   renderChart('tokChart', 'aggregate_tok_per_sec', 'tok/s');
@@ -403,6 +416,66 @@ function render() {
   renderChart('ramChart', 'ram_avg_gb', 'RAM (GB)');
   renderChart('totalTimeChart', 'avg_total_s', '평균 응답시간 (s)');
   renderTable();
+}
+
+// 장비/설정이 2개 이상일 때 지표별 승자를 가려주는 헤드투헤드 비교
+const COMPARE_METRICS = [
+  { field: 'p50_ttft', label: 'TTFT p50', lowerBetter: true, unit: 's' },
+  { field: 'aggregate_tok_per_sec', label: '전체 처리량', lowerBetter: false, unit: 'tok/s' },
+  { field: 'ttft_stddev', label: '안정성 (TTFT σ)', lowerBetter: true, unit: 's' },
+  { field: 'error_rate', label: '에러율', lowerBetter: true, unit: '%' },
+];
+
+function renderComparison() {
+  const panel = document.getElementById('comparePanel');
+  if (datasets.length < 2) { panel.style.display = 'none'; return; }
+  panel.style.display = 'block';
+
+  const allConcurrency = [...new Set(datasets.flatMap(d => d.rows.map(r => r.concurrency)))].sort((a, b) => a - b);
+  const wins = {}; datasets.forEach(d => wins[d.label] = 0);
+  const bodyRows = [];
+
+  COMPARE_METRICS.forEach(m => {
+    allConcurrency.forEach(c => {
+      const vals = datasets.map(d => {
+        const row = d.rows.find(r => r.concurrency === c);
+        return row ? row[m.field] : null;
+      });
+      if (vals.some(v => v === null || v === undefined)) return;
+      let winnerIdx = 0;
+      for (let i = 1; i < vals.length; i++) {
+        if (m.lowerBetter ? vals[i] < vals[winnerIdx] : vals[i] > vals[winnerIdx]) winnerIdx = i;
+      }
+      wins[datasets[winnerIdx].label]++;
+      bodyRows.push({ metric: `${m.label} (동시${c})`, vals, unit: m.unit, winnerIdx });
+    });
+  });
+
+  const ranked = Object.entries(wins).sort((a, b) => b[1] - a[1]);
+  const [topLabel, topWins] = ranked[0];
+  const tie = ranked.length > 1 && ranked[0][1] === ranked[1][1];
+
+  const headCols = datasets.map(d => `<th>${d.label}</th>`).join('');
+  const rows = bodyRows.map(r => {
+    const cells = r.vals.map((v, i) =>
+      `<td class="${i === r.winnerIdx ? 'win-cell' : ''}">${i === r.winnerIdx ? '<span class="medal">🏆</span>' : ''}${v}${r.unit}</td>`
+    ).join('');
+    return `<tr><td>${r.metric}</td>${cells}</tr>`;
+  }).join('');
+
+  panel.innerHTML = `
+    <div class="panel-title">⚔️ 장비 비교</div>
+    <div class="compare-headline">
+      <span class="crown">${tie ? '🤝' : '🏆'}</span>
+      <b>${tie ? '동률입니다' : `${topLabel} 우세`}</b>
+      <span class="sub">(${ranked.map(([l, w]) => `${l} ${w}승`).join(' · ')})</span>
+    </div>
+    <div class="table-wrap">
+      <table class="compare-table">
+        <thead><tr><th>지표 (동시성별)</th>${headCols}</tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>`;
 }
 
 function renderTiles() {
@@ -524,6 +597,37 @@ def judge_adoption(rows: list) -> tuple:
     return False, "기준 미달(" + ", ".join(reasons) + "). 클라우드 API(Gemini Flash 등) 유지가 ROI상 유리합니다."
 
 
+COMPARE_METRICS = [
+    ("p50_ttft", "TTFT p50", True, "s"),
+    ("aggregate_tok_per_sec", "전체 처리량", False, "tok/s"),
+    ("ttft_stddev", "안정성 (TTFT σ)", True, "s"),
+    ("error_rate", "에러율", True, "%"),
+]
+
+
+def compare_devices(datasets: list) -> dict:
+    """label(장비/설정)이 2개 이상일 때, 동시성이 겹치는 지점마다 지표별 승자를 집계해 헤드투헤드 비교 결과를 만듦"""
+    all_concurrency = sorted({r.get("concurrency") for ds in datasets for r in ds["rows"]})
+    wins = {ds["label"]: 0 for ds in datasets}
+    rows = []
+    for field, label, lower_better, unit in COMPARE_METRICS:
+        for c in all_concurrency:
+            vals = []
+            complete = True
+            for ds in datasets:
+                row = next((r for r in ds["rows"] if r.get("concurrency") == c), None)
+                if row is None or field not in row:
+                    complete = False
+                    break
+                vals.append(row[field])
+            if not complete:
+                continue
+            winner_idx = (min if lower_better else max)(range(len(vals)), key=lambda i: vals[i])
+            wins[datasets[winner_idx]["label"]] += 1
+            rows.append({"metric": f"{label} (동시{int(c)})", "vals": vals, "unit": unit, "winner_idx": winner_idx})
+    return {"wins": wins, "rows": rows}
+
+
 def generate_pdf_report(results_dir: str) -> str:
     """결과 폴더의 모든 CSV를 모아 label별 표 + 채택 판정을 담은 report.pdf 생성"""
     datasets = load_all_results(results_dir)
@@ -549,6 +653,41 @@ def generate_pdf_report(results_dir: str) -> str:
     if not datasets:
         story.append(Paragraph("결과 CSV가 없습니다. 먼저 벤치마크를 실행하세요.", styles["body"]))
     else:
+        if len(datasets) >= 2:
+            cmp = compare_devices(datasets)
+            ranked = sorted(cmp["wins"].items(), key=lambda kv: kv[1], reverse=True)
+            tie = len(ranked) > 1 and ranked[0][1] == ranked[1][1]
+            headline = "동률입니다" if tie else f"{ranked[0][0]} 우세"
+            story.append(Paragraph("장비 비교", styles["h2"]))
+            story.append(Paragraph(
+                f"{headline} ({' · '.join(f'{l} {w}승' for l, w in ranked)})",
+                styles["verdict_ok"]))
+            header_style = ParagraphStyle("cmpHeader", fontName=PDF_FONT, fontSize=8.5,
+                                           textColor=colors.white, alignment=1, leading=10)
+            cmp_header = [Paragraph("지표 (동시성별)", header_style)] + \
+                [Paragraph(ds["label"], header_style) for ds in datasets]
+            cmp_data = [cmp_header] + [
+                [r["metric"]] + [f"{v}{r['unit']}" for v in r["vals"]] for r in cmp["rows"]
+            ]
+            col_w = min(38 * mm, (269 * mm - 50 * mm) / max(len(datasets), 1))
+            cmp_table = Table(cmp_data, colWidths=[50 * mm] + [col_w] * len(datasets))
+            cmp_style = [
+                ("FONTNAME", (0, 0), (-1, -1), PDF_FONT),
+                ("FONTSIZE", (0, 0), (-1, -1), 8.5),
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2a2e3a")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cccccc")),
+                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f5f5f5")]),
+            ]
+            for row_i, r in enumerate(cmp["rows"], start=1):
+                col = r["winner_idx"] + 1
+                cmp_style.append(("TEXTCOLOR", (col, row_i), (col, row_i), colors.HexColor("#1a7f37")))
+                cmp_style.append(("FONTNAME", (col, row_i), (col, row_i), PDF_FONT))
+            cmp_table.setStyle(TableStyle(cmp_style))
+            story.append(cmp_table)
+            story.append(Spacer(1, 10 * mm))
+
         header = ["동시성", "TTFT p50(s)", "TTFT p95(s)", "TTFT σ", "평균 tok/s", "tok/s σ",
                    "전체 tok/s", "평균응답(s)", "에러율(%)", "RAM평균(GB)", "RAM피크(GB)"]
         col_widths = [16 * mm, 20 * mm, 20 * mm, 16 * mm, 20 * mm, 16 * mm,
