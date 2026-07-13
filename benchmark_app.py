@@ -1,0 +1,652 @@
+"""
+로컬 LLM 벤치마크 + 대시보드 올인원 앱
+
+동작 순서:
+  1. OpenAI 호환 엔드포인트(llama.cpp server / vLLM / Ollama)에 TTFT·동시성 부하 테스트 실행
+  2. 결과를 --results-dir 폴더에 {label}.csv 로 저장
+  3. 같은 폴더 안의 모든 CSV(과거 실행분 포함)를 다시 읽어 dashboard.html 자동 생성/갱신
+  4. 기본 브라우저로 대시보드 자동 오픈
+
+핵심: --results-dir 를 Dropbox/iCloud Drive/공유폴더/USB 등으로 지정하면
+Mac에서 돌린 결과와 Windows에서 돌린 결과가 같은 폴더에 쌓이고,
+아무 쪽에서나 dashboard.html을 열면 두 장비 비교가 바로 보인다.
+
+사용 예:
+  # Mac에서
+  python benchmark_app.py --url http://localhost:8080/v1/chat/completions \
+      --model gemma-4-E4B --label mac_e4b --results-dir ~/Dropbox/llm_bench
+
+  # Windows에서 (같은 공유 폴더 경로)
+  python benchmark_app.py --url http://localhost:8080/v1/chat/completions \
+      --model gemma-4-E4B --label windows_e4b --results-dir ~/Dropbox/llm_bench
+"""
+
+import argparse
+import asyncio
+import csv
+import glob
+import json
+import os
+import statistics
+import time
+import webbrowser
+
+import httpx
+import psutil
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.styles import ParagraphStyle
+from reportlab.lib.units import mm
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
+DEFAULT_PROMPT = "너는 고객 상담 챗봇이다. 배송 지연 문의에 대해 3문장으로 답변해줘."
+
+PDF_FONT = "HYSMyeongJo-Medium"  # reportlab 내장 CID 폰트 (한글, 별도 폰트 파일 불필요)
+pdfmetrics.registerFont(UnicodeCIDFont(PDF_FONT))
+
+
+async def single_request(client: httpx.AsyncClient, url: str, model: str, prompt: str) -> dict:
+    """단일 요청의 TTFT / 총 소요시간 / 생성 토큰 수를 측정. 실패 시 error 필드에 사유 기록"""
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": True,
+        "max_tokens": 256,
+    }
+    t_start = time.perf_counter()
+    ttft = None
+    token_count = 0
+    error = None
+
+    try:
+        async with client.stream("POST", url, json=payload, timeout=120) as resp:
+            resp.raise_for_status()
+            async for line in resp.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                data = line[len("data:"):].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+                delta = chunk.get("choices", [{}])[0].get("delta", {})
+                text = delta.get("content") or delta.get("reasoning")  # thinking 모델은 reasoning 필드로 먼저 스트리밍됨
+                if text:
+                    if ttft is None:
+                        ttft = time.perf_counter() - t_start  # 핵심 로직: 첫 토큰 도착 시각
+                    token_count += 1
+    except httpx.TimeoutException:
+        error = "timeout"
+    except httpx.HTTPStatusError as e:
+        error = f"http_{e.response.status_code}"
+    except httpx.HTTPError:
+        error = "connection_error"
+
+    total_time = time.perf_counter() - t_start
+    gen_time = total_time - (ttft or 0)
+    tok_per_sec = token_count / gen_time if gen_time > 0 else 0
+
+    return {
+        "ttft_s": round(ttft or 0, 3),
+        "total_s": round(total_time, 3),
+        "tokens": token_count,
+        "tok_per_sec": round(tok_per_sec, 2),
+        "error": error,
+    }
+
+
+async def sample_ram(samples: list, stop_event: asyncio.Event, interval: float = 0.5):
+    """부하 중 시스템 RAM 사용량(GB)을 주기적으로 샘플링 (장비 사양 판단용)"""
+    while not stop_event.is_set():
+        samples.append(psutil.virtual_memory().used / (1024 ** 3))
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval)
+        except asyncio.TimeoutError:
+            pass
+
+
+async def run_concurrency_level(url: str, model: str, prompt: str, concurrency: int, num_requests: int) -> tuple:
+    """동시 요청 N개를 반복 실행 (실전 챗봇 트래픽 시뮬레이션), RAM 사용량도 함께 샘플링"""
+    results = []
+    ram_samples = []
+    stop_event = asyncio.Event()
+    sampler = asyncio.create_task(sample_ram(ram_samples, stop_event))
+    wall_start = time.perf_counter()
+    async with httpx.AsyncClient() as client:
+        for _ in range(max(1, num_requests // concurrency)):
+            batch = await asyncio.gather(
+                *[single_request(client, url, model, prompt) for _ in range(concurrency)]
+            )
+            results.extend(batch)
+    wall_time = time.perf_counter() - wall_start
+    stop_event.set()
+    await sampler
+    return results, ram_samples, wall_time
+
+
+def summarize(results: list, ram_samples: list, wall_time: float) -> dict:
+    """
+    avg_tok_per_sec: 요청 1건이 체감하는 평균 생성 속도(사용자 관점)
+    aggregate_tok_per_sec: 이 동시성 구간 전체 실행 시간(wall_time) 동안 실제로 뽑아낸 총 토큰 수 기준 처리량(서버 관점).
+    순차 배치를 단순히 합산하면 동시성=1에서도 값이 배치 수만큼 부풀려지므로 wall_time 기준으로 계산함.
+    """
+    ok = [r for r in results if not r.get("error")]
+    error_rate = round(100 * (len(results) - len(ok)) / len(results), 1) if results else 0.0
+    ram_avg = round(statistics.mean(ram_samples), 2) if ram_samples else 0.0
+    ram_peak = round(max(ram_samples), 2) if ram_samples else 0.0
+
+    if not ok:
+        return {
+            "p50_ttft": 0.0, "p95_ttft": 0.0, "ttft_stddev": 0.0,
+            "avg_tok_per_sec": 0.0, "aggregate_tok_per_sec": 0.0, "tok_stddev": 0.0,
+            "avg_total_s": 0.0, "error_rate": error_rate,
+            "ram_avg_gb": ram_avg, "ram_peak_gb": ram_peak,
+        }
+
+    ttfts = [r["ttft_s"] for r in ok]
+    toks = [r["tok_per_sec"] for r in ok]
+    totals = [r["total_s"] for r in ok]
+    total_tokens = sum(r["tokens"] for r in ok)
+    return {
+        "p50_ttft": round(statistics.median(ttfts), 3),
+        "p95_ttft": round(sorted(ttfts)[int(len(ttfts) * 0.95) - 1], 3) if len(ttfts) > 1 else ttfts[0],
+        "ttft_stddev": round(statistics.pstdev(ttfts), 3) if len(ttfts) > 1 else 0.0,
+        "avg_tok_per_sec": round(statistics.mean(toks), 2),
+        "aggregate_tok_per_sec": round(total_tokens / wall_time, 2) if wall_time > 0 else 0.0,
+        "tok_stddev": round(statistics.pstdev(toks), 2) if len(toks) > 1 else 0.0,
+        "avg_total_s": round(statistics.mean(totals), 3),
+        "error_rate": error_rate,
+        "ram_avg_gb": ram_avg,
+        "ram_peak_gb": ram_peak,
+    }
+
+
+async def warmup(url: str, model: str, prompt: str) -> None:
+    """측정 시작 전 워밍업 1회 실행 — 모델 최초 로딩 지연이 첫 요청의 TTFT/안정성 통계를 오염시키는 것을 방지"""
+    print("[웜업] 모델 최초 로딩 대기 중...")
+    async with httpx.AsyncClient() as client:
+        await single_request(client, url, model, prompt)
+
+
+async def run_benchmark(url: str, model: str, prompt: str, concurrency_levels: list, num_requests: int) -> list:
+    await warmup(url, model, prompt)
+    all_rows = []
+    for c in concurrency_levels:
+        print(f"[동시성={c}] 테스트 중...")
+        results, ram_samples, wall_time = await run_concurrency_level(url, model, prompt, c, num_requests)
+        summary = summarize(results, ram_samples, wall_time)
+        summary["concurrency"] = c
+        print(f"  TTFT p50={summary['p50_ttft']}s(σ{summary['ttft_stddev']}) | "
+              f"평균 tok/s={summary['avg_tok_per_sec']}(σ{summary['tok_stddev']}) | "
+              f"전체처리량={summary['aggregate_tok_per_sec']} tok/s | "
+              f"평균응답={summary['avg_total_s']}s | 에러율={summary['error_rate']}% | "
+              f"RAM평균={summary['ram_avg_gb']}GB(peak {summary['ram_peak_gb']}GB)")
+        all_rows.append(summary)
+    return all_rows
+
+
+def save_csv(results_dir: str, label: str, rows: list) -> str:
+    path = os.path.join(results_dir, f"{label}.csv")
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+    return path
+
+
+def load_all_results(results_dir: str) -> list:
+    """결과 폴더 안의 모든 CSV(다른 장비가 넣은 것 포함)를 읽어 대시보드용 데이터로 변환"""
+    datasets = []
+    for path in sorted(glob.glob(os.path.join(results_dir, "*.csv"))):
+        label = os.path.splitext(os.path.basename(path))[0]
+        with open(path, newline="") as f:
+            rows = list(csv.DictReader(f))
+        for r in rows:
+            for k, v in r.items():
+                try:
+                    r[k] = float(v)
+                except (TypeError, ValueError):
+                    pass
+        datasets.append({"label": label, "rows": rows})
+    return datasets
+
+
+DASHBOARD_TEMPLATE = """<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>로컬 LLM 벤치마크 대시보드</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>⚡</text></svg>">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
+<style>
+  :root {
+    --page: #0d0d0d; --surface: #1a1a19; --surface-2: #232320; --border: rgba(255,255,255,0.10);
+    --ink: #ffffff; --ink-2: #c3c2b7; --ink-muted: #898781; --grid: #2c2c2a; --baseline: #383835;
+    --series-1: #3987e5; --series-2: #199e70; --series-3: #c98500; --series-4: #008300;
+    --series-5: #9085e9; --series-6: #e66767; --series-7: #d55181; --series-8: #d95926;
+    --good: #0ca30c; --warning: #fab219; --critical: #d03b3b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 32px; background: var(--page); color: var(--ink);
+    font-family: system-ui, -apple-system, "Pretendard", "Segoe UI", "Malgun Gothic", sans-serif;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; }
+  header { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 8px; margin-bottom: 4px; }
+  h1 { font-size: 21px; margin: 0; letter-spacing: -0.01em; }
+  .sub { color: var(--ink-2); font-size: 13px; }
+  .stamp { color: var(--ink-muted); font-size: 12px; margin-bottom: 22px; }
+  .report-link {
+    color: var(--series-1); text-decoration: none; font-size: 13px; border: 1px solid var(--border);
+    padding: 5px 12px; border-radius: 999px; transition: background 0.15s;
+  }
+  .report-link:hover { background: var(--surface-2); }
+
+  .panel {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 12px; padding: 20px; margin-bottom: 18px;
+    transition: border-color 0.15s;
+  }
+  .panel-title { font-size: 13px; color: var(--ink-2); font-weight: 600; margin-bottom: 14px; }
+
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; margin-bottom: 18px; }
+  .tile {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+    padding: 16px 18px; transition: transform 0.15s, border-color 0.15s, box-shadow 0.15s;
+  }
+  .tile:hover {
+    transform: translateY(-2px); border-color: rgba(255,255,255,0.22);
+    box-shadow: 0 8px 20px rgba(0,0,0,0.35);
+  }
+  .tile-label { font-size: 12px; color: var(--ink-muted); margin-bottom: 10px; display: flex; align-items: center; justify-content: space-between; }
+  .tile-stats { display: flex; gap: 18px; margin-bottom: 12px; }
+  .tile-stat-value { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1.1; }
+  .tile-stat-unit { font-size: 11px; color: var(--ink-muted); margin-top: 3px; }
+  .badge {
+    display: inline-flex; align-items: center; gap: 5px; font-size: 11px; font-weight: 600;
+    padding: 3px 9px; border-radius: 999px;
+  }
+  .badge::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+  .badge-good { color: var(--good); background: rgba(12,163,12,0.14); }
+  .badge-critical { color: var(--critical); background: rgba(208,59,59,0.14); }
+
+  .criteria { display: flex; flex-wrap: wrap; gap: 6px; padding-top: 12px; border-top: 1px solid var(--border); }
+  .chip {
+    display: inline-flex; align-items: center; gap: 4px; font-size: 10.5px; font-weight: 600;
+    padding: 3px 8px; border-radius: 999px; color: var(--ink-2); background: var(--surface-2);
+  }
+  .chip-pass { color: var(--good); }
+  .chip-fail { color: var(--critical); }
+
+  .charts { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+  @media (max-width: 900px) { .charts { grid-template-columns: 1fr; } .tiles { grid-template-columns: 1fr; } }
+  .chart-box {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 18px;
+    transition: border-color 0.15s, box-shadow 0.15s;
+  }
+  .chart-box:hover { border-color: rgba(255,255,255,0.18); box-shadow: 0 8px 20px rgba(0,0,0,0.3); }
+  .chart-title { font-size: 13px; color: var(--ink-2); margin-bottom: 10px; }
+
+  .table-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 12.5px; min-width: 820px; font-variant-numeric: tabular-nums; }
+  th, td { padding: 9px 10px; text-align: right; border-bottom: 1px solid var(--grid); }
+  th:first-child, td:first-child { text-align: left; font-variant-numeric: normal; }
+  th { color: var(--ink-muted); font-weight: 600; font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.02em; }
+  tbody tr:hover { background: var(--surface-2); }
+  .best { color: var(--good); font-weight: 700; }
+  .worst { color: var(--critical); font-weight: 700; }
+  .empty { color: var(--ink-muted); font-size: 13px; padding: 40px 0; text-align: center; }
+
+  .running {
+    display: none; align-items: center; background: rgba(250,178,25,0.10); border: 1px solid rgba(250,178,25,0.35);
+    color: var(--warning); padding: 14px 18px; border-radius: 12px; margin-bottom: 18px; font-size: 14px;
+  }
+  .spin {
+    display: inline-block; width: 11px; height: 11px; margin-right: 10px; flex: none;
+    border: 2px solid var(--warning); border-top-color: transparent; border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>⚡ 로컬 LLM 벤치마크 대시보드</h1>
+  <a class="report-link" href="report.pdf" target="_blank">📄 PDF 보고서 열기</a>
+</header>
+<div class="sub">결과 폴더(__RESULTS_DIR__)에 있는 모든 실행 결과를 자동으로 모아서 비교</div>
+<div class="stamp">마지막 생성: __GENERATED_AT__</div>
+
+<div id="runningBanner" class="running"></div>
+
+<div id="content">
+  <div id="tiles" class="tiles"></div>
+
+  <div class="charts" style="margin-bottom:18px;">
+    <div class="chart-box">
+      <div class="chart-title">TTFT p50 vs 동시성 (낮을수록 좋음)</div>
+      <canvas id="ttftChart" height="220"></canvas>
+    </div>
+    <div class="chart-box">
+      <div class="chart-title">전체 처리량 (aggregate tok/s) vs 동시성 (높을수록 좋음)</div>
+      <canvas id="tokChart" height="220"></canvas>
+    </div>
+    <div class="chart-box">
+      <div class="chart-title">안정성 (TTFT 표준편차) vs 동시성 (낮을수록 좋음)</div>
+      <canvas id="stddevChart" height="220"></canvas>
+    </div>
+    <div class="chart-box">
+      <div class="chart-title">에러율(%) vs 동시성 (낮을수록 좋음)</div>
+      <canvas id="errorChart" height="220"></canvas>
+    </div>
+    <div class="chart-box">
+      <div class="chart-title">RAM 평균 사용량(GB) vs 동시성</div>
+      <canvas id="ramChart" height="220"></canvas>
+    </div>
+    <div class="chart-box">
+      <div class="chart-title">평균 응답 완료 시간(s) vs 동시성 (낮을수록 좋음)</div>
+      <canvas id="totalTimeChart" height="220"></canvas>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-title">상세 결과</div>
+    <div class="table-wrap">
+      <table id="resultTable"><thead></thead><tbody></tbody></table>
+    </div>
+  </div>
+</div>
+<div id="emptyState" class="empty" style="display:none;">결과 CSV가 없음 — 먼저 benchmark_app.py를 실행해라</div>
+</div>
+
+<script>
+// dataviz skill 참조 팔레트(dark) — 카테고리 색은 고정 순서로만 배정
+const COLORS = ['#3987e5', '#199e70', '#c98500', '#008300', '#9085e9', '#e66767', '#d55181', '#d95926'];
+const INK_MUTED = '#898781';
+const GRID = '#2c2c2a';
+const datasets = __EMBEDDED_DATA__;
+const RUNNING_LABEL = __RUNNING_LABEL__;
+
+// README 판단 기준(judge_adoption)과 동일한 로직의 JS 미러
+function judgeAdoption(rows) {
+  const mid = rows.filter(r => r.concurrency >= 5 && r.concurrency <= 10);
+  const ttftOk = rows.length > 0 && rows.every(r => (r.p50_ttft ?? 999) <= 1.0);
+  const tokOk = mid.length > 0 && mid.every(r => (r.avg_tok_per_sec ?? 0) >= 20);
+  const errorOk = rows.length > 0 && rows.every(r => (r.error_rate ?? 100) <= 5.0);
+  return { ok: ttftOk && tokOk && errorOk, ttftOk, tokOk, errorOk };
+}
+
+function render() {
+  const banner = document.getElementById('runningBanner');
+  if (RUNNING_LABEL) {
+    banner.style.display = 'flex';
+    banner.innerHTML = `<span class="spin"></span>"${RUNNING_LABEL}" 벤치마크 실행 중입니다. 완료되면 이 페이지를 새로고침하세요.`;
+    document.getElementById('content').style.display = 'none';
+    document.getElementById('emptyState').style.display = 'none';
+    return;
+  }
+  banner.style.display = 'none';
+  document.getElementById('emptyState').style.display = datasets.length ? 'none' : 'block';
+  document.getElementById('content').style.display = datasets.length ? 'block' : 'none';
+  if (!datasets.length) return;
+  renderTiles();
+  renderChart('ttftChart', 'p50_ttft', 'TTFT (s)');
+  renderChart('tokChart', 'aggregate_tok_per_sec', 'tok/s');
+  renderChart('stddevChart', 'ttft_stddev', 'TTFT σ (s)');
+  renderChart('errorChart', 'error_rate', '에러율 (%)');
+  renderChart('ramChart', 'ram_avg_gb', 'RAM (GB)');
+  renderChart('totalTimeChart', 'avg_total_s', '평균 응답시간 (s)');
+  renderTable();
+}
+
+function renderTiles() {
+  document.getElementById('tiles').innerHTML = datasets.map((d, i) => {
+    const rows = d.rows;
+    const bestTok = Math.max(...rows.map(r => r.aggregate_tok_per_sec || 0));
+    const bestTtft = Math.min(...rows.map(r => r.p50_ttft ?? Infinity));
+    const v = judgeAdoption(rows);
+    const color = COLORS[i % COLORS.length];
+    const chip = (pass, text) => `<span class="chip ${pass ? 'chip-pass' : 'chip-fail'}">${pass ? '✓' : '✗'} ${text}</span>`;
+    return `
+      <div class="tile">
+        <div class="tile-label">
+          <span style="color:${color};font-weight:600;">● ${d.label}</span>
+          <span class="badge ${v.ok ? 'badge-good' : 'badge-critical'}">${v.ok ? '채택 가능' : '채택 보류'}</span>
+        </div>
+        <div class="tile-stats">
+          <div>
+            <div class="tile-stat-value">${bestTok.toFixed(1)}</div>
+            <div class="tile-stat-unit">최대 처리량 tok/s</div>
+          </div>
+          <div>
+            <div class="tile-stat-value">${bestTtft === Infinity ? '-' : bestTtft.toFixed(2)}</div>
+            <div class="tile-stat-unit">최소 TTFT (s)</div>
+          </div>
+        </div>
+        <div class="criteria">
+          ${chip(v.ttftOk, 'TTFT≤1s')}
+          ${chip(v.tokOk, '동시5~10 ≥20tok/s')}
+          ${chip(v.errorOk, '에러율≤5%')}
+        </div>
+      </div>`;
+  }).join('');
+}
+
+function renderChart(canvasId, field, axisLabel) {
+  const allConcurrency = [...new Set(datasets.flatMap(d => d.rows.map(r => r.concurrency)))].sort((a, b) => a - b);
+  const chartDatasets = datasets.map((d, i) => ({
+    label: d.label,
+    data: allConcurrency.map(c => {
+      const row = d.rows.find(r => r.concurrency === c);
+      return row ? row[field] : null;
+    }),
+    borderColor: COLORS[i % COLORS.length],
+    backgroundColor: COLORS[i % COLORS.length],
+    borderWidth: 2,
+    pointRadius: 4,
+    tension: 0.25,
+    spanGaps: true,
+  }));
+  new Chart(document.getElementById(canvasId).getContext('2d'), {
+    type: 'line',
+    data: { labels: allConcurrency.map(c => `동시 ${c}`), datasets: chartDatasets },
+    options: {
+      responsive: true,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { display: datasets.length > 1, labels: { color: '#c3c2b7', usePointStyle: true, pointStyle: 'circle' } },
+        tooltip: {
+          backgroundColor: '#232320', borderColor: 'rgba(255,255,255,0.10)', borderWidth: 1,
+          titleColor: '#ffffff', bodyColor: '#c3c2b7', padding: 10, cornerRadius: 8,
+          displayColors: true, boxPadding: 4,
+        },
+      },
+      scales: {
+        x: { ticks: { color: INK_MUTED }, grid: { color: GRID } },
+        y: { ticks: { color: INK_MUTED }, grid: { color: GRID }, title: { display: true, text: axisLabel, color: INK_MUTED } },
+      },
+    },
+  });
+}
+
+function renderTable() {
+  const cols = ['label', 'concurrency', 'p50_ttft', 'p95_ttft', 'ttft_stddev', 'avg_tok_per_sec', 'tok_stddev',
+                'aggregate_tok_per_sec', 'avg_total_s', 'error_rate', 'ram_avg_gb', 'ram_peak_gb'];
+  const headers = ['결과', '동시성', 'TTFT p50(s)', 'TTFT p95(s)', 'TTFT σ', '평균 tok/s', 'tok/s σ',
+                    '전체 tok/s', '평균응답(s)', '에러율(%)', 'RAM평균(GB)', 'RAM피크(GB)'];
+  document.querySelector('#resultTable thead').innerHTML = '<tr>' + headers.map(h => `<th>${h}</th>`).join('') + '</tr>';
+
+  const allRows = [];
+  datasets.forEach(d => d.rows.forEach(r => allRows.push({ label: d.label, ...r })));
+  const bestTok = Math.max(...allRows.map(r => r.aggregate_tok_per_sec || 0));
+  const worstTtft = Math.max(...allRows.map(r => r.p50_ttft || 0));
+
+  document.querySelector('#resultTable tbody').innerHTML = allRows.map(r => {
+    return '<tr>' + cols.map(c => {
+      let cls = c === 'aggregate_tok_per_sec' && r[c] === bestTok ? 'best'
+              : c === 'p50_ttft' && r[c] === worstTtft ? 'worst'
+              : c === 'error_rate' && r[c] > 0 ? 'worst' : '';
+      return `<td class="${cls}">${r[c] ?? '-'}</td>`;
+    }).join('') + '</tr>';
+  }).join('');
+}
+
+render();
+</script>
+</body>
+</html>
+"""
+
+
+def judge_adoption(rows: list) -> tuple:
+    """README 판단 기준: TTFT p50<=1s AND 동시 5~10명 구간 사용자당 tok/s>=20 AND 에러율<=5% → 온프레미스 채택 가능"""
+    mid_rows = [r for r in rows if 5 <= r.get("concurrency", 0) <= 10]
+    ttft_ok = bool(rows) and all(r.get("p50_ttft", 999) <= 1.0 for r in rows)
+    tok_ok = bool(mid_rows) and all(r.get("avg_tok_per_sec", 0) >= 20 for r in mid_rows)
+    error_ok = bool(rows) and all(r.get("error_rate", 100) <= 5.0 for r in rows)
+
+    if ttft_ok and tok_ok and error_ok:
+        return True, "TTFT p50 1초 이하, 동시 5~10명 구간 사용자당 20 tok/s 이상, 에러율 5% 이하를 모두 충족합니다. 온프레미스 챗봇 채택이 가능한 수준입니다."
+
+    reasons = []
+    if not ttft_ok:
+        reasons.append("TTFT p50이 1초를 초과하는 구간이 있음")
+    if not tok_ok:
+        reasons.append("동시 5~10명 구간에서 사용자당 tok/s가 20 미만이거나 해당 구간 측정값이 없음")
+    if not error_ok:
+        reasons.append("에러율이 5%를 초과하는 구간이 있음")
+    return False, "기준 미달(" + ", ".join(reasons) + "). 클라우드 API(Gemini Flash 등) 유지가 ROI상 유리합니다."
+
+
+def generate_pdf_report(results_dir: str) -> str:
+    """결과 폴더의 모든 CSV를 모아 label별 표 + 채택 판정을 담은 report.pdf 생성"""
+    datasets = load_all_results(results_dir)
+    out_path = os.path.join(results_dir, "report.pdf")
+
+    styles = {
+        "title": ParagraphStyle("title", fontName=PDF_FONT, fontSize=18, leading=22, spaceAfter=4),
+        "meta": ParagraphStyle("meta", fontName=PDF_FONT, fontSize=9, textColor=colors.grey, spaceAfter=14),
+        "h2": ParagraphStyle("h2", fontName=PDF_FONT, fontSize=13, leading=16, spaceBefore=16, spaceAfter=6),
+        "body": ParagraphStyle("body", fontName=PDF_FONT, fontSize=10, leading=15),
+        "verdict_ok": ParagraphStyle("verdict_ok", fontName=PDF_FONT, fontSize=10, leading=15,
+                                      textColor=colors.HexColor("#1a7f37"), spaceBefore=6),
+        "verdict_ng": ParagraphStyle("verdict_ng", fontName=PDF_FONT, fontSize=10, leading=15,
+                                      textColor=colors.HexColor("#c0392b"), spaceBefore=6),
+    }
+
+    story = [
+        Paragraph("로컬 LLM 벤치마크 결과 보고서", styles["title"]),
+        Paragraph(f"생성 일시: {time.strftime('%Y-%m-%d %H:%M:%S')} | 결과 폴더: {os.path.abspath(results_dir)}",
+                  styles["meta"]),
+    ]
+
+    if not datasets:
+        story.append(Paragraph("결과 CSV가 없습니다. 먼저 벤치마크를 실행하세요.", styles["body"]))
+    else:
+        header = ["동시성", "TTFT p50(s)", "TTFT p95(s)", "TTFT σ", "평균 tok/s", "tok/s σ",
+                   "전체 tok/s", "평균응답(s)", "에러율(%)", "RAM평균(GB)", "RAM피크(GB)"]
+        col_widths = [16 * mm, 20 * mm, 20 * mm, 16 * mm, 20 * mm, 16 * mm,
+                      20 * mm, 20 * mm, 18 * mm, 22 * mm, 22 * mm]
+        for ds in datasets:
+            story.append(Paragraph(f"결과: {ds['label']}", styles["h2"]))
+            table_data = [header]
+            for r in ds["rows"]:
+                table_data.append([
+                    r.get("concurrency", "-"),
+                    r.get("p50_ttft", "-"),
+                    r.get("p95_ttft", "-"),
+                    r.get("ttft_stddev", "-"),
+                    r.get("avg_tok_per_sec", "-"),
+                    r.get("tok_stddev", "-"),
+                    r.get("aggregate_tok_per_sec", "-"),
+                    r.get("avg_total_s", "-"),
+                    r.get("error_rate", "-"),
+                    r.get("ram_avg_gb", "-"),
+                    r.get("ram_peak_gb", "-"),
+                ])
+            table = Table(table_data, colWidths=col_widths)
+            table.setStyle(TableStyle([
+                ("FONTNAME", (0, 0), (-1, -1), PDF_FONT),
+                ("FONTSIZE", (0, 0), (-1, -1), 8),
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2a2e3a")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cccccc")),
+                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f5f5f5")]),
+            ]))
+            story.append(table)
+
+            ok, reason = judge_adoption(ds["rows"])
+            story.append(Paragraph(f"판정: {'채택 가능' if ok else '채택 보류'} — {reason}",
+                                    styles["verdict_ok"] if ok else styles["verdict_ng"]))
+
+        story.append(Paragraph("판단 기준", styles["h2"]))
+        story.append(Paragraph(
+            "TTFT p50 1초 이하, 동시 5~10명 구간에서 사용자당 20 tok/s 이상, 에러율 5% 이하를 모두 만족하면 "
+            "온프레미스 챗봇 채택 가능. 못 미치면 클라우드 API(Gemini Flash 등) 유지가 ROI상 유리. "
+            "TTFT σ / tok/s σ는 표준편차로 응답 일관성(안정성)을 나타내며, 값이 클수록 응답 편차가 커 사용자 체감 품질이 불안정함을 의미함.",
+            styles["body"]))
+
+    doc = SimpleDocTemplate(out_path, pagesize=landscape(A4),
+                             topMargin=16 * mm, bottomMargin=16 * mm,
+                             leftMargin=14 * mm, rightMargin=14 * mm)
+    doc.build(story)
+    return out_path
+
+
+def generate_dashboard(results_dir: str, running_label: str = None) -> str:
+    """running_label을 넘기면 진행중 배너만 표시하고 기존 데이터는 비워서 보여줌(진행 중인 실행과 과거 결과 혼동 방지)"""
+    datasets = [] if running_label else load_all_results(results_dir)
+    html = (
+        DASHBOARD_TEMPLATE
+        .replace("__EMBEDDED_DATA__", json.dumps(datasets, ensure_ascii=False))
+        .replace("__RESULTS_DIR__", os.path.abspath(results_dir))
+        .replace("__GENERATED_AT__", time.strftime("%Y-%m-%d %H:%M:%S"))
+        .replace("__RUNNING_LABEL__", json.dumps(running_label, ensure_ascii=False))
+    )
+    out_path = os.path.join(results_dir, "dashboard.html")
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(html)
+    return out_path
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--url", required=True, help="예: http://localhost:8080/v1/chat/completions")
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--label", required=True, help="예: mac_e4b, windows_e4b (CSV 파일명 & 범례로 사용)")
+    parser.add_argument("--results-dir", default="./llm_benchmark_results",
+                         help="Dropbox/iCloud Drive 등 공유 폴더를 지정하면 여러 장비 결과를 한 대시보드에서 비교 가능")
+    parser.add_argument("--prompt", default=DEFAULT_PROMPT)
+    parser.add_argument("--concurrency", default="1,5,10", help="콤마로 구분된 동시 요청 수 리스트")
+    parser.add_argument("--num-requests", type=int, default=20, help="동시성 레벨당 총 요청 수")
+    parser.add_argument("--no-browser", action="store_true", help="테스트 후 브라우저 자동 오픈 끄기")
+    args = parser.parse_args()
+
+    results_dir = os.path.expanduser(args.results_dir)
+    os.makedirs(results_dir, exist_ok=True)
+    concurrency_levels = [int(x) for x in args.concurrency.split(",")]
+
+    dashboard_path = generate_dashboard(results_dir, running_label=args.label)
+    if not args.no_browser:
+        webbrowser.open(f"file://{os.path.abspath(dashboard_path)}")
+
+    rows = asyncio.run(run_benchmark(args.url, args.model, args.prompt, concurrency_levels, args.num_requests))
+    csv_path = save_csv(results_dir, args.label, rows)
+    print(f"결과 저장: {csv_path}")
+
+    dashboard_path = generate_dashboard(results_dir)
+    print(f"대시보드 갱신: {dashboard_path}")
+
+    report_path = generate_pdf_report(results_dir)
+    print(f"보고서 생성: {report_path}")
+
+
+if __name__ == "__main__":
+    main()
