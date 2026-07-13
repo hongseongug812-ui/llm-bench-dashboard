@@ -38,13 +38,19 @@ from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import mm
 from reportlab.pdfbase import pdfmetrics
-from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 DEFAULT_PROMPT = "너는 고객 상담 챗봇이다. 배송 지연 문의에 대해 3문장으로 답변해줘."
 
-PDF_FONT = "HYSMyeongJo-Medium"  # reportlab 내장 CID 폰트 (한글, 별도 폰트 파일 불필요)
-pdfmetrics.registerFont(UnicodeCIDFont(PDF_FONT))
+# 내장 CID 폰트(HYSMyeongJo-Medium)는 라틴 문자를 전각으로 그려 "TTFT"가 "T T F T"처럼 벌어지는 문제가 있어
+# 폭이 정상인 오픈소스 한글 폰트(NanumGothic, SIL OFL)로 교체함 — assets/fonts/에 번들
+_FONT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "fonts")
+PDF_FONT = "NanumGothic"
+PDF_FONT_BOLD = "NanumGothic-Bold"
+pdfmetrics.registerFont(TTFont(PDF_FONT, os.path.join(_FONT_DIR, "NanumGothic-Regular.ttf")))
+pdfmetrics.registerFont(TTFont(PDF_FONT_BOLD, os.path.join(_FONT_DIR, "NanumGothic-Bold.ttf")))
+pdfmetrics.registerFontFamily(PDF_FONT, normal=PDF_FONT, bold=PDF_FONT_BOLD)
 
 
 async def single_request(client: httpx.AsyncClient, url: str, model: str, prompt: str) -> dict:
@@ -600,7 +606,7 @@ def judge_adoption(rows: list) -> tuple:
 COMPARE_METRICS = [
     ("p50_ttft", "TTFT p50", True, "s"),
     ("aggregate_tok_per_sec", "전체 처리량", False, "tok/s"),
-    ("ttft_stddev", "안정성 (TTFT σ)", True, "s"),
+    ("ttft_stddev", "안정성 (TTFT SD)", True, "s"),
     ("error_rate", "에러율", True, "%"),
 ]
 
@@ -634,14 +640,16 @@ def generate_pdf_report(results_dir: str) -> str:
     out_path = os.path.join(results_dir, "report.pdf")
 
     styles = {
-        "title": ParagraphStyle("title", fontName=PDF_FONT, fontSize=18, leading=22, spaceAfter=4),
+        "title": ParagraphStyle("title", fontName=PDF_FONT_BOLD, fontSize=20, leading=24, spaceAfter=4,
+                                 textColor=colors.HexColor("#12141a")),
         "meta": ParagraphStyle("meta", fontName=PDF_FONT, fontSize=9, textColor=colors.grey, spaceAfter=14),
-        "h2": ParagraphStyle("h2", fontName=PDF_FONT, fontSize=13, leading=16, spaceBefore=16, spaceAfter=6),
+        "h2": ParagraphStyle("h2", fontName=PDF_FONT_BOLD, fontSize=13, leading=16, spaceBefore=18, spaceAfter=8,
+                              textColor=colors.HexColor("#12141a")),
         "body": ParagraphStyle("body", fontName=PDF_FONT, fontSize=10, leading=15),
-        "verdict_ok": ParagraphStyle("verdict_ok", fontName=PDF_FONT, fontSize=10, leading=15,
-                                      textColor=colors.HexColor("#1a7f37"), spaceBefore=6),
-        "verdict_ng": ParagraphStyle("verdict_ng", fontName=PDF_FONT, fontSize=10, leading=15,
-                                      textColor=colors.HexColor("#c0392b"), spaceBefore=6),
+        "verdict_ok": ParagraphStyle("verdict_ok", fontName=PDF_FONT_BOLD, fontSize=11, leading=16,
+                                      textColor=colors.HexColor("#1a7f37"), spaceBefore=8),
+        "verdict_ng": ParagraphStyle("verdict_ng", fontName=PDF_FONT_BOLD, fontSize=11, leading=16,
+                                      textColor=colors.HexColor("#c0392b"), spaceBefore=8),
     }
 
     story = [
@@ -662,7 +670,7 @@ def generate_pdf_report(results_dir: str) -> str:
             story.append(Paragraph(
                 f"{headline} ({' · '.join(f'{l} {w}승' for l, w in ranked)})",
                 styles["verdict_ok"]))
-            header_style = ParagraphStyle("cmpHeader", fontName=PDF_FONT, fontSize=8.5,
+            header_style = ParagraphStyle("cmpHeader", fontName=PDF_FONT_BOLD, fontSize=8.5,
                                            textColor=colors.white, alignment=1, leading=10)
             cmp_header = [Paragraph("지표 (동시성별)", header_style)] + \
                 [Paragraph(ds["label"], header_style) for ds in datasets]
@@ -674,6 +682,7 @@ def generate_pdf_report(results_dir: str) -> str:
             cmp_style = [
                 ("FONTNAME", (0, 0), (-1, -1), PDF_FONT),
                 ("FONTSIZE", (0, 0), (-1, -1), 8.5),
+                ("FONTNAME", (0, 0), (-1, 0), PDF_FONT_BOLD),
                 ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2a2e3a")),
                 ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
                 ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cccccc")),
@@ -688,7 +697,7 @@ def generate_pdf_report(results_dir: str) -> str:
             story.append(cmp_table)
             story.append(Spacer(1, 10 * mm))
 
-        header = ["동시성", "TTFT p50(s)", "TTFT p95(s)", "TTFT σ", "평균 tok/s", "tok/s σ",
+        header = ["동시성", "TTFT p50(s)", "TTFT p95(s)", "TTFT SD", "평균 tok/s", "tok/s SD",
                    "전체 tok/s", "평균응답(s)", "에러율(%)", "RAM평균(GB)", "RAM피크(GB)"]
         col_widths = [16 * mm, 20 * mm, 20 * mm, 16 * mm, 20 * mm, 16 * mm,
                       20 * mm, 20 * mm, 18 * mm, 22 * mm, 22 * mm]
@@ -713,6 +722,7 @@ def generate_pdf_report(results_dir: str) -> str:
             table.setStyle(TableStyle([
                 ("FONTNAME", (0, 0), (-1, -1), PDF_FONT),
                 ("FONTSIZE", (0, 0), (-1, -1), 8),
+                ("FONTNAME", (0, 0), (-1, 0), PDF_FONT_BOLD),
                 ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2a2e3a")),
                 ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
                 ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cccccc")),
@@ -722,20 +732,44 @@ def generate_pdf_report(results_dir: str) -> str:
             story.append(table)
 
             ok, reason = judge_adoption(ds["rows"])
-            story.append(Paragraph(f"판정: {'채택 가능' if ok else '채택 보류'} — {reason}",
-                                    styles["verdict_ok"] if ok else styles["verdict_ng"]))
+            verdict_bg = colors.HexColor("#e9f7ee") if ok else colors.HexColor("#fbeceb")
+            verdict_table = Table(
+                [[Paragraph(f"판정: {'채택 가능' if ok else '채택 보류'} — {reason}",
+                            styles["verdict_ok"] if ok else styles["verdict_ng"])]],
+                colWidths=[269 * mm],
+            )
+            verdict_table.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, -1), verdict_bg),
+                ("LEFTPADDING", (0, 0), (-1, -1), 10),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+                ("TOPPADDING", (0, 0), (-1, -1), 8),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+            ]))
+            story.append(Spacer(1, 6 * mm))
+            story.append(verdict_table)
 
         story.append(Paragraph("판단 기준", styles["h2"]))
         story.append(Paragraph(
             "TTFT p50 1초 이하, 동시 5~10명 구간에서 사용자당 20 tok/s 이상, 에러율 5% 이하를 모두 만족하면 "
             "온프레미스 챗봇 채택 가능. 못 미치면 클라우드 API(Gemini Flash 등) 유지가 ROI상 유리. "
-            "TTFT σ / tok/s σ는 표준편차로 응답 일관성(안정성)을 나타내며, 값이 클수록 응답 편차가 커 사용자 체감 품질이 불안정함을 의미함.",
+            "TTFT SD / tok/s SD는 표준편차로 응답 일관성(안정성)을 나타내며, 값이 클수록 응답 편차가 커 사용자 체감 품질이 불안정함을 의미함.",
             styles["body"]))
 
+    def _decorate_page(canvas, doc_):
+        canvas.saveState()
+        page_w, page_h = landscape(A4)
+        canvas.setFillColor(colors.HexColor("#5b8cff"))
+        canvas.rect(0, page_h - 4, page_w, 4, stroke=0, fill=1)
+        canvas.setFont(PDF_FONT, 8)
+        canvas.setFillColor(colors.grey)
+        canvas.drawString(14 * mm, 10 * mm, "llm-bench-dashboard 자동 생성 보고서")
+        canvas.drawRightString(page_w - 14 * mm, 10 * mm, f"{canvas.getPageNumber()}p")
+        canvas.restoreState()
+
     doc = SimpleDocTemplate(out_path, pagesize=landscape(A4),
-                             topMargin=16 * mm, bottomMargin=16 * mm,
+                             topMargin=16 * mm, bottomMargin=18 * mm,
                              leftMargin=14 * mm, rightMargin=14 * mm)
-    doc.build(story)
+    doc.build(story, onFirstPage=_decorate_page, onLaterPages=_decorate_page)
     return out_path
 
 

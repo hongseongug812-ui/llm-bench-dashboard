@@ -103,7 +103,10 @@ pip install httpx psutil reportlab --break-system-packages
 |---|---|
 | `httpx` | 비동기 스트리밍 요청 |
 | `psutil` | 부하 중 RAM 사용량 샘플링 |
-| `reportlab` | PDF 보고서 생성 (한글 CID 폰트 내장, 별도 폰트 파일 불필요) |
+| `reportlab` | PDF 보고서 생성 |
+
+> [!NOTE]
+> PDF 한글 폰트는 reportlab 내장 CID 폰트 대신 `assets/fonts/`에 번들된 [NanumGothic](https://github.com/google/fonts/tree/main/ofl/nanumgothic)(SIL OFL 1.1)을 사용한다. 내장 CID 폰트는 라틴 문자를 전각으로 그려 `TTFT`가 `T T F T`처럼 벌어지는 문제가 있어서 교체함 — 별도 설치 없이 저장소에 이미 포함돼 있다.
 
 ## 실행
 
