@@ -1,9 +1,11 @@
 __pycache__/
 *.pyc
 .DS_Store
+.claude/
 
 # 실행 결과물(장비별 벤치마크 데이터) — 소스가 아니라 산출물이라 제외
 results/*.csv
 results/dashboard.html
 results/report.pdf
+results/variance-check/
 !results/.gitkeep
