@@ -277,7 +277,11 @@ def save_csv(results_dir: str, label: str, rows: list) -> str:
 
 
 def load_all_results(results_dir: str) -> list:
-    """결과 폴더 안의 모든 CSV(다른 장비가 넣은 것 포함)를 읽어 대시보드용 데이터로 변환"""
+    """결과 폴더 안의 모든 CSV(다른 장비가 넣은 것 포함)를 읽어 대시보드용 데이터로 변환.
+
+    "CSV 복사" 버튼으로 복사한 내용을 다른 장비에서 붙여넣으면 spec/price_krw 열이
+    측정 지표와 함께 섞여 들어오는데, 이 경우 분리해서 device_meta.json에 저장하고
+    (그 장비의 가격/사양이 자동으로 넘어감) 측정 지표 표에서는 빠지도록 제거한다."""
     datasets = []
     for path in sorted(glob.glob(os.path.join(results_dir, "*.csv"))):
         label = os.path.splitext(os.path.basename(path))[0]
@@ -289,6 +293,18 @@ def load_all_results(results_dir: str) -> list:
                     r[k] = float(v)
                 except (TypeError, ValueError):
                     pass
+
+        embedded_spec, embedded_price = None, None
+        for r in rows:
+            spec_val = r.pop("spec", None)
+            if spec_val and embedded_spec is None:
+                embedded_spec = spec_val
+            price_val = r.pop("price_krw", None)
+            if price_val is not None and embedded_price is None:
+                embedded_price = price_val
+        if embedded_spec or embedded_price is not None:
+            save_device_meta(results_dir, _base_label(label), spec=embedded_spec or "", price_krw=embedded_price)
+
         datasets.append({"label": label, "rows": rows})
     return datasets
 
@@ -962,9 +978,14 @@ function renderTiles() {
 function labelCsv(label) {
   const ds = datasets.find(d => d.label === label);
   if (!ds || !ds.rows.length) return '';
-  const cols = Object.keys(ds.rows[0]);
+  // 사양·가격도 같이 복사해서, 다른 장비에 붙여넣을 때(import_result.py 등) 자동으로 같이 넘어가게 함
+  // (측정 지표는 동시성마다 다르지만 spec/price_krw는 장비 하나당 값이라 모든 행에 동일하게 반복됨)
+  const extra = {};
+  if (ds.spec) extra.spec = ds.spec;
+  if (typeof ds.price_krw === 'number') extra.price_krw = ds.price_krw;
+  const cols = [...Object.keys(ds.rows[0]), ...Object.keys(extra)];
   const lines = [cols.join(',')];
-  ds.rows.forEach(r => lines.push(cols.map(c => r[c]).join(',')));
+  ds.rows.forEach(r => lines.push(cols.map(c => (c in extra ? extra[c] : r[c])).join(',')));
   return lines.join('\\n');
 }
 
