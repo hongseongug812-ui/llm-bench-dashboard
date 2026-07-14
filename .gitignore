@@ -7,5 +7,6 @@ __pycache__/
 results/*.csv
 results/dashboard.html
 results/report.pdf
+results/device_meta.json
 results/variance-check/
 !results/.gitkeep
