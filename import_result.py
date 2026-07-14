@@ -1,7 +1,8 @@
 """
 다른 장비(Windows 등)에서 benchmark_app.py를 실행해 나온 결과 CSV의 내용을
-파일 전송 없이 그대로 복사해서 붙여넣으면, 이 폴더의 비교 대시보드/PDF에
-바로 반영해주는 도구.
+파일 전송 없이 그대로 복사해서 붙여넣으면, 이 폴더의 비교 대시보드에
+바로 반영해주는 도구. (report.pdf는 여기서 자동 생성되지 않음 — 모든 장비
+결과를 다 모은 뒤 make_report.py를 따로 실행해서 최종 보고서를 만든다)
 
 사용법:
   1. 다른 장비에서 benchmark_app.py 실행 → results/{label}.csv 생성됨
@@ -11,6 +12,8 @@
      실행 후 복사한 CSV 내용을 붙여넣고 끝나면
        Mac/Linux: Ctrl+D
        Windows:   Ctrl+Z 후 Enter
+  4. 모든 장비 결과를 다 모았으면:
+       python make_report.py --results-dir ./results
 """
 
 import argparse
@@ -20,7 +23,7 @@ import os
 import sys
 import webbrowser
 
-from benchmark_app import generate_dashboard, generate_pdf_report
+from benchmark_app import generate_dashboard
 
 
 def main():
@@ -49,9 +52,8 @@ def main():
     print(f"등록됨: {out_path} ({len(rows)}개 행)")
 
     dashboard_path = generate_dashboard(results_dir)
-    report_path = generate_pdf_report(results_dir)
     print(f"대시보드 갱신: {dashboard_path}")
-    print(f"보고서 생성: {report_path}")
+    print(f"모든 장비 결과를 다 모았으면 'python make_report.py --results-dir {args.results_dir}'로 최종 보고서를 생성해라.")
 
     if not args.no_browser:
         webbrowser.open(f"file://{os.path.abspath(dashboard_path)}")

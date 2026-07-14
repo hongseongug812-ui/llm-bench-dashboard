@@ -417,6 +417,39 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
 <div id="runningBanner" class="running"></div>
 
+<div class="panel">
+  <div class="panel-title">📥 결과 요약 — 다른 장비 결과 붙여넣기</div>
+  <div class="sub" style="margin-bottom:10px;">
+    다른 장비(Windows 등)에서 benchmark_app.py를 실행해 나온 CSV 내용을 그대로 붙여넣으면, 이 화면(차트·비교)에 바로 반영된다.
+    파일 전송은 필요 없다. 단, 이건 <b>이 브라우저 화면에서만 보이는 미리보기</b>이며 새로고침하면 사라진다 —
+    나중에도 남기려면 "CSV 다운로드"로 저장한 뒤 <code>results/</code> 폴더에 넣어라.
+  </div>
+  <div style="display:flex; gap:10px; flex-wrap:wrap; margin-bottom:10px;">
+    <input id="pasteLabel" type="text" placeholder="라벨 (예: windows_gemma4_12b)"
+           style="flex:1; min-width:220px; background:var(--surface-2); border:1px solid var(--border); color:var(--ink); padding:8px 10px; border-radius:8px; font-family:inherit; font-size:13px;">
+  </div>
+  <textarea id="pasteCsv" rows="4" placeholder="CSV 내용을 여기에 붙여넣으세요 (헤더 포함)"
+            style="width:100%; background:var(--surface-2); border:1px solid var(--border); color:var(--ink); padding:10px; border-radius:8px; font-family:ui-monospace,monospace; font-size:12px; resize:vertical;"></textarea>
+  <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; align-items:center;">
+    <button class="copy-btn" id="addResultBtn">➕ 비교에 추가 (미리보기)</button>
+    <button class="copy-btn" id="downloadCsvBtn">💾 CSV 다운로드</button>
+    <span id="pasteStatus" class="sub"></span>
+  </div>
+</div>
+
+<div class="panel">
+  <div class="panel-title">📄 최종 보고서 만들기</div>
+  <div class="sub" style="margin-bottom:10px;">
+    이 페이지는 정적 파일이라 브라우저에서 바로 PDF를 만들 수는 없다. 아래 명령을 복사해서 터미널에 붙여넣으면
+    <code>results/</code> 폴더 안 모든 CSV(Mac·Windows 등)를 모아 <code>report.pdf</code>를 새로 생성한다.
+    다른 장비 결과까지 <code>results/</code>에 다 모은 뒤 마지막에 한 번 실행하면 된다.
+  </div>
+  <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+    <button class="copy-btn" id="makeReportBtn">📄 보고서 생성 명령 복사</button>
+    <span id="reportStatus" class="sub"></span>
+  </div>
+</div>
+
 <div id="content">
   <div id="comparePanel" class="panel" style="display:none;"></div>
 
@@ -468,8 +501,9 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 const COLORS = ['#3987e5', '#199e70', '#c98500', '#008300', '#9085e9', '#e66767', '#d55181', '#d95926'];
 const INK_MUTED = '#898781';
 const GRID = '#2c2c2a';
-const datasets = __EMBEDDED_DATA__;
+let datasets = __EMBEDDED_DATA__;
 const RUNNING_LABEL = __RUNNING_LABEL__;
+const RESULTS_DIR_ABS = __RESULTS_DIR_JSON__;
 
 // README 판단 기준(judge_adoption)과 동일한 로직의 JS 미러
 function judgeAdoption(rows) {
@@ -699,6 +733,60 @@ function renderTable() {
   }).join('');
 }
 
+// 콤마 구분 CSV(따옴표 없는 단순 숫자표) 텍스트를 파싱 — benchmark_app.py가 저장하는 형식과 동일
+function parseCsv(text) {
+  const lines = text.trim().split(/\\r?\\n/).filter(l => l.trim().length);
+  if (lines.length < 2) return null;
+  const headers = lines[0].split(',').map(h => h.trim());
+  const rows = lines.slice(1).map(line => {
+    const parts = line.split(',');
+    const row = {};
+    headers.forEach((h, i) => {
+      const raw = (parts[i] ?? '').trim();
+      const n = parseFloat(raw);
+      row[h] = (raw !== '' && raw !== '-' && !isNaN(n)) ? n : (raw || '-');
+    });
+    return row;
+  });
+  return rows;
+}
+
+document.getElementById('addResultBtn').addEventListener('click', () => {
+  const label = document.getElementById('pasteLabel').value.trim();
+  const status = document.getElementById('pasteStatus');
+  if (!label) { status.textContent = '⚠️ 라벨(장비 이름)을 먼저 입력하세요'; return; }
+  const rows = parseCsv(document.getElementById('pasteCsv').value);
+  if (!rows) { status.textContent = '⚠️ CSV 형식이 아닙니다 (헤더 + 최소 1행 필요)'; return; }
+  datasets = datasets.filter(d => d.label !== label);
+  datasets.push({ label, rows });
+  render();
+  status.textContent = `✅ "${label}" 비교에 추가됨 — 이 브라우저 화면에서만 반영(새로고침하면 사라짐). 남기려면 CSV 다운로드 후 results/ 폴더에 저장.`;
+});
+
+document.getElementById('downloadCsvBtn').addEventListener('click', () => {
+  const label = document.getElementById('pasteLabel').value.trim() || 'pasted_result';
+  const text = document.getElementById('pasteCsv').value;
+  const status = document.getElementById('pasteStatus');
+  if (!text.trim()) { status.textContent = '⚠️ 먼저 CSV 내용을 붙여넣으세요'; return; }
+  const blob = new Blob([text], { type: 'text/csv' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `${label}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+  status.textContent = `💾 "${label}.csv" 다운로드됨 — results/ 폴더로 옮겨넣어라.`;
+});
+
+document.getElementById('makeReportBtn').addEventListener('click', () => {
+  const cmd = `python make_report.py --results-dir "${RESULTS_DIR_ABS}"`;
+  copyText(cmd);
+  const status = document.getElementById('reportStatus');
+  status.textContent = `✅ 복사됨: ${cmd}`;
+});
+
 render();
 </script>
 </body>
@@ -914,6 +1002,7 @@ def generate_dashboard(results_dir: str, running_label: str = None) -> str:
         .replace("__RESULTS_DIR__", os.path.abspath(results_dir))
         .replace("__GENERATED_AT__", time.strftime("%Y-%m-%d %H:%M:%S"))
         .replace("__RUNNING_LABEL__", json.dumps(running_label, ensure_ascii=False))
+        .replace("__RESULTS_DIR_JSON__", json.dumps(os.path.abspath(results_dir), ensure_ascii=False))
     )
     out_path = os.path.join(results_dir, "dashboard.html")
     with open(out_path, "w", encoding="utf-8") as f:
@@ -956,9 +1045,7 @@ def main():
 
     dashboard_path = generate_dashboard(results_dir)
     print(f"대시보드 갱신: {dashboard_path}")
-
-    report_path = generate_pdf_report(results_dir)
-    print(f"보고서 생성: {report_path}")
+    print(f"모든 장비 결과를 다 모았으면 'python make_report.py --results-dir {args.results_dir}'로 최종 보고서를 생성해라.")
 
 
 if __name__ == "__main__":
