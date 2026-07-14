@@ -34,6 +34,7 @@ import re
 import shutil
 import statistics
 import subprocess
+import tempfile
 import time
 import webbrowser
 
@@ -45,7 +46,7 @@ from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import mm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 DEFAULT_PROMPT = "너는 고객 상담 챗봇이다. 배송 지연 문의에 대해 3문장으로 답변해줘."
 
@@ -331,20 +332,31 @@ def save_device_meta(results_dir: str, base_label: str, spec: str = "", price_kr
     return meta
 
 
+_DEVICE_PREFIX_RE = re.compile(r"^(mac|macos|windows|win|pc)_", re.IGNORECASE)
+
+
+def _model_guess(base_label: str) -> str:
+    """라벨 앞에 붙는 장비 접두사(mac_, windows_ 등)를 떼서 대략적인 모델/설정 이름을 추정.
+    'mac_gemma4_12b'와 'gemma4_12b'가 같은 모델을 가리키는 걸 알아보기 위함."""
+    return _DEVICE_PREFIX_RE.sub("", base_label)
+
+
 def group_repeated_runs(datasets: list, results_dir: str = None) -> list:
     """반복 실행된 결과를 하나의 대표 데이터셋(동시성별 중앙값)으로 묶는다.
 
     묶는 기준은 두 단계:
-    1) device_meta.json에 자동 감지된 사양(spec)이 있으면 그 사양이 같은 결과끼리 묶는다
-       — 라벨 이름이 달라도(예: 'mac_gemma4_12b' vs 'gemma4_12b_20260714_...') 같은 물리 장비면 하나로 합쳐짐.
+    1) device_meta.json에 자동 감지된 사양(spec)이 있으면, "사양이 같고 + 모델 추정명도 같은" 결과끼리 묶는다
+       — 라벨 이름이 달라도(예: 'mac_gemma4_12b' vs 'gemma4_12b_20260714_...') 같은 물리 장비·같은 모델이면 하나로
+       합쳐지지만, 같은 장비에서 다른 모델(gemma4:26b 등)을 돌리면 섞이지 않는다.
     2) 사양 정보가 없는 옛 결과는 기존처럼 라벨의 타임스탬프(_YYYYMMDD_HHMMSS)를 뗀 이름으로 묶는다.
-    실제로 다른 장비(예: Windows)는 감지된 사양 자체가 다르므로 자동으로 별개로 남는다."""
+    실제로 다른 장비(예: Windows)는 감지된 사양 자체가 다르므로 자동으로 별개로 남는다.
+    표시 라벨은 감지된 장비 이름을 앞에 붙여서 보여준다 (예: "Mac (Apple M5) — gemma4_12b")."""
     meta = load_device_meta(results_dir) if results_dir else {}
 
     def group_key(label):
         base = _base_label(label)
         spec = (meta.get(base) or {}).get("spec")
-        return f"spec:{spec.strip().lower()}" if spec else f"label:{base}"
+        return f"spec:{spec.strip().lower()}|{_model_guess(base).lower()}" if spec else f"label:{base}"
 
     groups: dict = {}
     order = []
@@ -362,10 +374,15 @@ def group_repeated_runs(datasets: list, results_dir: str = None) -> list:
         members = groups[key]["members"]
         base_labels = groups[key]["base_labels"]
         rep_base = max(set(base_labels), key=base_labels.count)  # 가장 많이 등장한 라벨 이름을 대표로 사용
+        spec = (meta.get(rep_base) or {}).get("spec") or next(
+            (meta.get(b, {}).get("spec") for b in base_labels if meta.get(b, {}).get("spec")), None)
+        display_name = spec if spec else rep_base
 
         if len(members) == 1:
             members[0]["base_label"] = rep_base
             members[0]["member_base_labels"] = list(set(base_labels))
+            if spec:
+                members[0]["label"] = display_name
             result.append(members[0])
             continue
 
@@ -388,7 +405,7 @@ def group_repeated_runs(datasets: list, results_dir: str = None) -> list:
             rep_rows.append(row)
 
         result.append({
-            "label": f"{rep_base} (n={len(members)}, 중앙값)",
+            "label": f"{display_name} (n={len(members)}, 중앙값)",
             "base_label": rep_base,
             "member_base_labels": list(set(base_labels)),
             "rows": rep_rows,
@@ -964,7 +981,7 @@ function renderChart(canvasId, field, axisLabel) {
       responsive: true,
       interaction: { mode: 'index', intersect: false },
       plugins: {
-        legend: { display: datasets.length > 1, labels: { color: '#c3c2b7', usePointStyle: true, pointStyle: 'circle' } },
+        legend: { display: true, labels: { color: '#c3c2b7', usePointStyle: true, pointStyle: 'circle' } },
         tooltip: {
           backgroundColor: '#232320', borderColor: 'rgba(255,255,255,0.10)', borderWidth: 1,
           titleColor: '#ffffff', bodyColor: '#c3c2b7', padding: 10, cornerRadius: 8,
@@ -1183,6 +1200,57 @@ def compare_devices(datasets: list) -> dict:
     return {"wins": wins, "rows": rows}
 
 
+def _generate_chart_image(datasets: list, out_path: str) -> str:
+    """대시보드와 같은 팔레트로 TTFT·처리량·안정성·에러율 4개 그래프를 그려 하나의 PNG로 저장.
+    선이 여러 개일 때 어떤 게 어떤 장비인지 구분되도록 장비마다 고정된 색 + 범례를 붙인다."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib import font_manager
+
+    font_manager.fontManager.addfont(os.path.join(_FONT_DIR, "NanumGothic-Regular.ttf"))
+    plt.rcParams["font.family"] = "NanumGothic"
+    plt.rcParams["axes.unicode_minus"] = False  # 한글 폰트는 유니코드 마이너스 글리프가 없는 경우가 많음
+
+    colors_ = ["#3987e5", "#199e70", "#c98500", "#008300", "#9085e9", "#e66767", "#d55181", "#d95926"]
+    metrics = [
+        ("p50_ttft", "TTFT p50 (s) — 낮을수록 좋음"),
+        ("aggregate_tok_per_sec", "전체 처리량 (tok/s) — 높을수록 좋음"),
+        ("ttft_stddev", "안정성 TTFT σ (s) — 낮을수록 좋음"),
+        ("error_rate", "에러율 (%) — 낮을수록 좋음"),
+    ]
+
+    fig, axes = plt.subplots(2, 2, figsize=(10, 6.2))
+    all_concurrency = sorted({r.get("concurrency") for ds in datasets for r in ds["rows"]
+                               if isinstance(r.get("concurrency"), (int, float))})
+    for ax, (field, title) in zip(axes.flat, metrics):
+        for i, ds in enumerate(datasets):
+            xy = [(r["concurrency"], r[field]) for r in ds["rows"]
+                  if isinstance(r.get(field), (int, float)) and isinstance(r.get("concurrency"), (int, float))]
+            if not xy:
+                continue
+            xy.sort()
+            xs, ys = zip(*xy)
+            ax.plot(xs, ys, marker="o", markersize=5, linewidth=2,
+                    color=colors_[i % len(colors_)], label=ds["label"])
+        ax.set_title(title, fontsize=9.5)
+        ax.set_xlabel("동시성", fontsize=8.5)
+        ax.grid(True, color="#e5e5e5", linewidth=0.6)
+        ax.spines[["top", "right"]].set_visible(False)
+        if all_concurrency:
+            ax.set_xticks(all_concurrency)
+        ax.tick_params(labelsize=8)
+
+    handles, labels_ = axes.flat[0].get_legend_handles_labels()
+    fig.legend(handles, labels_, loc="upper center", ncol=min(len(datasets), 3),
+               bbox_to_anchor=(0.5, 1.04), fontsize=8.5, frameon=False)
+    fig.tight_layout(rect=(0, 0, 1, 0.92))
+
+    fig.savefig(out_path, dpi=160, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    return out_path
+
+
 def generate_pdf_report(results_dir: str) -> str:
     """결과 폴더의 모든 CSV를 모아 label별 표 + 채택 판정을 담은 report.pdf 생성"""
     datasets = attach_device_meta(group_repeated_runs(load_all_results(results_dir), results_dir), results_dir)
@@ -1250,9 +1318,20 @@ def generate_pdf_report(results_dir: str) -> str:
         styles["body"]))
     story.append(Spacer(1, 8 * mm))
 
+    chart_tmp_path = None
     if not datasets:
         story.append(Paragraph("결과 CSV가 없습니다. 먼저 벤치마크를 실행하세요.", styles["body"]))
     else:
+        story.append(Paragraph("측정 결과 그래프", styles["h2"]))
+        chart_tmp_fd, chart_tmp_path = tempfile.mkstemp(suffix=".png")
+        os.close(chart_tmp_fd)
+        try:
+            _generate_chart_image(datasets, chart_tmp_path)
+            story.append(Image(chart_tmp_path, width=249 * mm, height=154 * mm))
+        except Exception as e:
+            story.append(Paragraph(f"그래프 생성 실패: {e}", styles["body"]))
+        story.append(Spacer(1, 8 * mm))
+
         if len(datasets) >= 2:
             cmp = compare_devices(datasets)
             ranked = sorted(cmp["wins"].items(), key=lambda kv: kv[1], reverse=True)
@@ -1346,7 +1425,11 @@ def generate_pdf_report(results_dir: str) -> str:
     doc = SimpleDocTemplate(out_path, pagesize=landscape(A4),
                              topMargin=16 * mm, bottomMargin=18 * mm,
                              leftMargin=14 * mm, rightMargin=14 * mm)
-    doc.build(story, onFirstPage=_decorate_page, onLaterPages=_decorate_page)
+    try:
+        doc.build(story, onFirstPage=_decorate_page, onLaterPages=_decorate_page)
+    finally:
+        if chart_tmp_path and os.path.exists(chart_tmp_path):
+            os.remove(chart_tmp_path)
     return out_path
 
 
