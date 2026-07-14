@@ -840,6 +840,15 @@ function renderComparison() {
 }
 
 // 가격이 입력된 장비가 2개 이상일 때, 구매가 대비 처리량(가성비)을 비교
+// 채택 판단 기준과 같은 "동시 5~10명" 구간 평균을 실사용 처리량으로 사용 — 특정 동시성에서
+// 우연히 튄 최댓값 하나로 가성비가 왜곡되는 것을 피하기 위함(순간 최대치가 아니라 실사용 구간 기준)
+function realisticThroughput(rows) {
+  const mid = rows.filter(r => r.concurrency >= 5 && r.concurrency <= 10 && typeof r.aggregate_tok_per_sec === 'number');
+  if (mid.length) return mid.reduce((s, r) => s + r.aggregate_tok_per_sec, 0) / mid.length;
+  const all = rows.map(r => r.aggregate_tok_per_sec || 0);
+  return all.length ? Math.max(...all) : 0;
+}
+
 function renderPricePanel() {
   const panel = document.getElementById('pricePanel');
   const priced = datasets.filter(d => typeof d.price_krw === 'number' && d.price_krw > 0);
@@ -847,9 +856,9 @@ function renderPricePanel() {
   panel.style.display = 'block';
 
   const items = priced.map(d => {
-    const bestTok = Math.max(...d.rows.map(r => r.aggregate_tok_per_sec || 0));
-    const perManwon = bestTok / (d.price_krw / 10000);
-    return { label: d.label, spec: d.spec || '', price: d.price_krw, bestTok, perManwon };
+    const tok = realisticThroughput(d.rows);
+    const perManwon = tok / (d.price_krw / 10000);
+    return { label: d.label, spec: d.spec || '', price: d.price_krw, tok, perManwon };
   }).sort((a, b) => b.perManwon - a.perManwon);
 
   const rows = items.map((it, i) => `
@@ -857,7 +866,7 @@ function renderPricePanel() {
       <td>${i === 0 ? '<span class="medal">🏆</span>' : ''}${it.label}</td>
       <td>${it.spec || '-'}</td>
       <td>${it.price.toLocaleString()}원</td>
-      <td>${it.bestTok.toFixed(1)}</td>
+      <td>${it.tok.toFixed(1)}</td>
       <td class="${i === 0 ? 'win-cell' : ''}">${it.perManwon.toFixed(2)}</td>
     </tr>`).join('');
 
@@ -866,11 +875,11 @@ function renderPricePanel() {
     <div class="compare-headline">
       <span class="crown">🏆</span>
       <b>${items[0].label} 가성비 우세</b>
-      <span class="sub">(만원당 ${items[0].perManwon.toFixed(2)} tok/s — 최대 처리량 기준)</span>
+      <span class="sub">(만원당 ${items[0].perManwon.toFixed(2)} tok/s — 동시 5~10명 실사용 구간 평균 기준)</span>
     </div>
     <div class="table-wrap">
       <table class="compare-table">
-        <thead><tr><th>장비</th><th>사양</th><th>구매가</th><th>최대 처리량(tok/s)</th><th>만원당 tok/s</th></tr></thead>
+        <thead><tr><th>장비</th><th>사양</th><th>구매가</th><th>실사용 처리량(동시5~10, tok/s)</th><th>만원당 tok/s</th></tr></thead>
         <tbody>${rows}</tbody>
       </table>
     </div>`;
@@ -1223,6 +1232,34 @@ def compare_devices(datasets: list) -> dict:
     return {"wins": wins, "rows": rows}
 
 
+def _realistic_throughput(rows: list) -> float:
+    """채택 판단 기준과 같은 '동시 5~10명' 구간 평균을 실사용 처리량으로 사용.
+    특정 동시성에서 우연히 튄 최댓값 하나로 가성비가 왜곡되는 것을 피하기 위함."""
+    mid = [r["aggregate_tok_per_sec"] for r in rows
+           if isinstance(r.get("concurrency"), (int, float)) and 5 <= r["concurrency"] <= 10
+           and isinstance(r.get("aggregate_tok_per_sec"), (int, float))]
+    if mid:
+        return sum(mid) / len(mid)
+    all_vals = [r.get("aggregate_tok_per_sec", 0) for r in rows if isinstance(r.get("aggregate_tok_per_sec"), (int, float))]
+    return max(all_vals) if all_vals else 0.0
+
+
+def compute_price_efficiency(datasets: list) -> list:
+    """가격이 입력된 장비가 2개 이상일 때, 만원당 tok/s(가성비) 기준으로 정렬한 목록을 만듦"""
+    priced = [ds for ds in datasets if isinstance(ds.get("price_krw"), (int, float)) and ds["price_krw"] > 0]
+    if len(priced) < 2:
+        return []
+    items = []
+    for ds in priced:
+        tok = _realistic_throughput(ds["rows"])
+        items.append({
+            "label": ds["label"], "spec": ds.get("spec", ""), "price": ds["price_krw"],
+            "tok": round(tok, 1), "per_manwon": round(tok / (ds["price_krw"] / 10000), 2),
+        })
+    items.sort(key=lambda it: it["per_manwon"], reverse=True)
+    return items
+
+
 def _generate_chart_image(datasets: list, out_path: str) -> str:
     """대시보드와 같은 팔레트로 TTFT·처리량·안정성·에러율 4개 그래프를 그려 하나의 PNG로 저장.
     선이 여러 개일 때 어떤 게 어떤 장비인지 구분되도록 장비마다 고정된 색 + 범례를 붙인다."""
@@ -1390,6 +1427,35 @@ def generate_pdf_report(results_dir: str) -> str:
             cmp_table.setStyle(TableStyle(cmp_style))
             story.append(cmp_table)
             story.append(Spacer(1, 10 * mm))
+
+            price_items = compute_price_efficiency(datasets)
+            if price_items:
+                story.append(Paragraph("가격 대비 성능", styles["h2"]))
+                story.append(Paragraph(
+                    f"{price_items[0]['label']} 가성비 우세 "
+                    f"(만원당 {price_items[0]['per_manwon']} tok/s — 동시 5~10명 실사용 구간 평균 기준)",
+                    styles["verdict_ok"]))
+                price_header = [Paragraph(h, header_style) for h in
+                                ["장비", "사양", "구매가", "실사용 처리량(동시5~10, tok/s)", "만원당 tok/s"]]
+                price_data = [price_header] + [
+                    [it["label"], it["spec"] or "-", f"{it['price']:,.0f}원", it["tok"], it["per_manwon"]]
+                    for it in price_items
+                ]
+                price_table = Table(price_data, colWidths=[55 * mm, 65 * mm, 35 * mm, 55 * mm, 40 * mm])
+                price_style = [
+                    ("FONTNAME", (0, 0), (-1, -1), PDF_FONT),
+                    ("FONTSIZE", (0, 0), (-1, -1), 8.5),
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2a2e3a")),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                    ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cccccc")),
+                    ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+                    ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f5f5f5")]),
+                    ("TEXTCOLOR", (4, 1), (4, 1), colors.HexColor("#1a7f37")),
+                    ("FONTNAME", (4, 1), (4, 1), PDF_FONT_BOLD),
+                ]
+                price_table.setStyle(TableStyle(price_style))
+                story.append(price_table)
+                story.append(Spacer(1, 10 * mm))
 
         header = ["동시성", "TTFT p50(s)", "TTFT p95(s)", "TTFT SD", "평균 tok/s", "tok/s SD",
                    "전체 tok/s", "평균응답(s)", "에러율(%)", "RAM평균(GB)", "RAM피크(GB)",
