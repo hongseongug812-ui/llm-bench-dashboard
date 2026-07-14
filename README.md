@@ -123,7 +123,7 @@ python benchmark_app.py \
 실행 순서:
 
 1. 🔥 워밍업 요청 1회 (모델 최초 로딩 지연이 통계를 오염시키지 않도록 배제)
-2. 📊 동시성 레벨별로 TTFT·처리량·안정성·에러율·RAM 측정
+2. 📊 동시성 레벨별로 TTFT·처리량·안정성·에러율·RAM·전력 측정
 3. 💾 `results/{label}.csv` 저장
 4. 🖥️ `results/dashboard.html` 자동 생성/갱신 후 브라우저 오픈 — **실행 중에는 "테스트 진행중" 배너만 뜨고 이전 결과는 비워서 보여줌** (오래된 데이터와 혼동 방지)
 5. 📄 `results/report.pdf` 자동 생성 (label별 측정 표 + 라벨이 2개 이상이면 장비 비교 섹션)
@@ -182,6 +182,13 @@ python import_result.py --label windows_gemma4_12b --results-dir ./results
 | `avg_total_s` | 요청 시작~완료까지 평균 총 소요 시간 |
 | `error_rate` | 타임아웃 · HTTP 에러로 실패한 요청 비율(%) |
 | `ram_avg_gb` / `ram_peak_gb` | 부하 중 시스템 RAM 평균 / 피크 사용량(GB) — 장비 사양(메모리) 판단용 |
+| `power_avg_w` / `power_peak_w` | 부하 중 전력 소모량 평균 / 피크(W). 측정 불가 환경에서는 `-`로 표기 (아래 참고) |
+
+> [!NOTE]
+> **전력 측정은 플랫폼별로 조건이 다르다.**
+> - **Windows/Linux + Nvidia GPU**: `nvidia-smi`가 PATH에 있으면 별도 설정 없이 자동 측정됨.
+> - **macOS**: `powermetrics`는 root 권한이 필요함. 측정하려면 `sudo python benchmark_app.py ...`로 실행해야 하며, 일반 권한으로 실행하면 `power_avg_w`/`power_peak_w`가 `-`로 표기된다.
+> - 둘 다 지원되지 않는 환경에서는 해당 열이 `-`로 남고, 대시보드 차트·장비 비교에서는 자동으로 제외된다(측정 안 된 값으로 승패를 매기지 않음).
 
 ## 채택 판단 기준
 
