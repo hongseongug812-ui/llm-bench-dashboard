@@ -539,13 +539,23 @@ function judgeAdoption(rows) {
   return { ok: ttftOk && tokOk && errorOk, ttftOk, tokOk, errorOk };
 }
 
+function showRunningBanner(label, statusLine) {
+  const banner = document.getElementById('runningBanner');
+  banner.style.display = 'flex';
+  const extra = statusLine ? ` — ${statusLine}` : '';
+  banner.innerHTML = `<span class="spin"></span>"${label}" 벤치마크 실행 중입니다${extra}`;
+  document.getElementById('content').style.display = 'none';
+  document.getElementById('emptyState').style.display = 'none';
+}
+
+function hideRunningBanner() {
+  document.getElementById('runningBanner').style.display = 'none';
+}
+
 function render() {
   const banner = document.getElementById('runningBanner');
   if (RUNNING_LABEL) {
-    banner.style.display = 'flex';
-    banner.innerHTML = `<span class="spin"></span>"${RUNNING_LABEL}" 벤치마크 실행 중입니다. 완료되면 이 페이지를 새로고침하세요.`;
-    document.getElementById('content').style.display = 'none';
-    document.getElementById('emptyState').style.display = 'none';
+    showRunningBanner(RUNNING_LABEL);
     return;
   }
   banner.style.display = 'none';
@@ -841,13 +851,14 @@ document.getElementById('startRunBtn').addEventListener('click', async () => {
     }
     status.textContent = `⏳ "${data.label}" 실행 중...`;
     startBtn.disabled = true;
-    pollRunStatus();
+    showRunningBanner(data.label, '요청 보냄, 응답 대기 중...');
+    pollRunStatus(data.label);
   } catch (e) {
     status.textContent = '⚠️ 서버에 연결할 수 없습니다 — python server.py로 이 페이지를 띄웠는지 확인하세요 (파일을 직접 열면 동작하지 않음)';
   }
 });
 
-function pollRunStatus() {
+function pollRunStatus(label) {
   clearInterval(runPollTimer);
   const startBtn = document.getElementById('startRunBtn');
   const status = document.getElementById('runStatus');
@@ -856,14 +867,24 @@ function pollRunStatus() {
     try {
       const res = await fetch('/api/status');
       const data = await res.json();
+      const log = data.log || [];
       logBox.style.display = 'block';
-      logBox.textContent = (data.log || []).join('\\n');
+      logBox.textContent = log.join('\\n');
       logBox.scrollTop = logBox.scrollHeight;
+      if (data.running) {
+        showRunningBanner(label, log.length ? log[log.length - 1] : '진행 중...');
+      }
       if (!data.running) {
         clearInterval(runPollTimer);
         startBtn.disabled = false;
-        status.textContent = data.error ? `⚠️ 에러: ${data.error}` : '✅ 완료 — 잠시 후 새로고침됩니다';
-        if (!data.error) setTimeout(() => location.reload(), 1500);
+        if (data.error) {
+          status.textContent = `⚠️ 에러: ${data.error}`;
+          hideRunningBanner();
+        } else {
+          status.textContent = '✅ 완료 — 잠시 후 새로고침됩니다';
+          showRunningBanner(label, '완료! 새로고침 중...');
+          setTimeout(() => location.reload(), 1200);
+        }
       }
     } catch (e) { /* 일시적 네트워크 오류는 무시하고 다음 폴링에서 재시도 */ }
   }, 2000);
