@@ -30,6 +30,7 @@ import glob
 import json
 import os
 import platform
+import re
 import shutil
 import statistics
 import time
@@ -288,6 +289,62 @@ def load_all_results(results_dir: str) -> list:
                     pass
         datasets.append({"label": label, "rows": rows})
     return datasets
+
+
+_TIMESTAMP_SUFFIX_RE = re.compile(r"_\d{8}_\d{6}$")  # server.py가 자동으로 붙이는 _YYYYMMDD_HHMMSS
+
+
+def _base_label(label: str) -> str:
+    """server.py '테스트 시작' 버튼이 자동으로 붙이는 타임스탬프(_YYYYMMDD_HHMMSS)를 떼어낸 기본 라벨.
+    직접 --label로 지정한(타임스탬프 없는) 라벨은 그대로 반환됨."""
+    return _TIMESTAMP_SUFFIX_RE.sub("", label)
+
+
+def group_repeated_runs(datasets: list) -> list:
+    """같은 모델/설정을 반복 실행해 라벨 끝에 타임스탬프만 다르게 붙은 결과들을 자동으로 묶어
+    동시성별 중앙값 하나의 대표 데이터셋으로 요약한다 (반복 횟수·TTFT 편차도 같이 담음).
+    10번이고 20번이고 반복해도 대시보드/장비비교 표가 개별 실행 수만큼 늘어나지 않게 하기 위함."""
+    groups: dict = {}
+    order = []
+    for ds in datasets:
+        base = _base_label(ds["label"])
+        if base not in groups:
+            groups[base] = []
+            order.append(base)
+        groups[base].append(ds)
+
+    result = []
+    for base in order:
+        members = groups[base]
+        if len(members) == 1:
+            result.append(members[0])
+            continue
+
+        all_concurrency = sorted({r.get("concurrency") for ds in members for r in ds["rows"]})
+        rep_rows = []
+        ttft_spreads = []
+        for c in all_concurrency:
+            sample_rows = [next((r for r in ds["rows"] if r.get("concurrency") == c), None) for ds in members]
+            sample_rows = [r for r in sample_rows if r is not None]
+            if not sample_rows:
+                continue
+            row = {"concurrency": c}
+            fields = [k for k in sample_rows[0].keys() if k != "concurrency"]
+            for field in fields:
+                vals = [r[field] for r in sample_rows if isinstance(r.get(field), (int, float))]
+                row[field] = round(statistics.median(vals), 3) if vals else "-"
+            ttft_vals = [r["p50_ttft"] for r in sample_rows if isinstance(r.get("p50_ttft"), (int, float))]
+            if len(ttft_vals) > 1:
+                ttft_spreads.append(max(ttft_vals) - min(ttft_vals))
+            rep_rows.append(row)
+
+        result.append({
+            "label": f"{base} (n={len(members)}, 중앙값)",
+            "rows": rep_rows,
+            "run_count": len(members),
+            "ttft_spread": round(max(ttft_spreads), 3) if ttft_spreads else 0,
+        })
+    return result
 
 
 DASHBOARD_TEMPLATE = """<!DOCTYPE html>
@@ -649,6 +706,7 @@ function renderTiles() {
           <span style="color:${color};font-weight:600;">● ${d.label}</span>
           <span class="badge ${v.ok ? 'badge-good' : 'badge-critical'}">${v.ok ? '채택 가능' : '채택 보류'}</span>
         </div>
+        ${d.run_count > 1 ? `<div class="sub" style="margin-bottom:10px;">🔁 ${d.run_count}회 반복 실행의 중앙값 (TTFT 편차 최대 ±${d.ttft_spread}s)</div>` : ''}
         <div class="tile-stats">
           <div>
             <div class="tile-stat-value">${bestTok.toFixed(1)}</div>
@@ -931,7 +989,7 @@ def compare_devices(datasets: list) -> dict:
 
 def generate_pdf_report(results_dir: str) -> str:
     """결과 폴더의 모든 CSV를 모아 label별 표 + 채택 판정을 담은 report.pdf 생성"""
-    datasets = load_all_results(results_dir)
+    datasets = group_repeated_runs(load_all_results(results_dir))
     out_path = os.path.join(results_dir, "report.pdf")
 
     styles = {
@@ -1098,7 +1156,7 @@ def generate_pdf_report(results_dir: str) -> str:
 
 def generate_dashboard(results_dir: str, running_label: str = None) -> str:
     """running_label을 넘기면 진행중 배너만 표시하고 기존 데이터는 비워서 보여줌(진행 중인 실행과 과거 결과 혼동 방지)"""
-    datasets = [] if running_label else load_all_results(results_dir)
+    datasets = [] if running_label else group_repeated_runs(load_all_results(results_dir))
     html = (
         DASHBOARD_TEMPLATE
         .replace("__EMBEDDED_DATA__", json.dumps(datasets, ensure_ascii=False))
