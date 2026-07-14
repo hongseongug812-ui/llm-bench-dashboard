@@ -655,12 +655,14 @@ function renderTiles() {
           ${chip(v.errorOk, '에러율≤5%')}
         </div>
         <div style="margin-top:12px;">
-          <button class="copy-btn" data-label="${d.label}">📋 CSV 복사 (다른 장비 결과 붙여넣기용)</button>
+          <button class="copy-btn tile-copy-btn" data-label="${d.label}">📋 CSV 복사 (다른 장비 결과 붙여넣기용)</button>
         </div>
       </div>`;
   }).join('');
 
-  document.querySelectorAll('.copy-btn').forEach(btn => {
+  // .copy-btn은 여러 버튼(테스트 시작·보고서 명령 복사 등)이 스타일 공유용으로 같이 쓰므로,
+  // 이 라벨별 CSV 복사 핸들러는 .tile-copy-btn으로 범위를 좁혀서 붙인다 (안 그러면 다른 버튼까지 걸림)
+  document.querySelectorAll('.tile-copy-btn').forEach(btn => {
     btn.addEventListener('click', () => {
       copyText(labelCsv(btn.dataset.label));
       const original = btn.textContent;
