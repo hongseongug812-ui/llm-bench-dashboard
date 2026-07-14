@@ -278,6 +278,13 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
   }
   .badge::before { content: ''; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
   .badge-good { color: var(--good); background: rgba(12,163,12,0.14); }
+  .copy-btn {
+    font-size: 10.5px; font-weight: 600; color: var(--ink-2); background: var(--surface-2);
+    border: 1px solid var(--border); border-radius: 999px; padding: 3px 9px; cursor: pointer;
+    font-family: inherit; transition: background 0.15s, color 0.15s;
+  }
+  .copy-btn:hover { background: rgba(255,255,255,0.14); color: var(--ink); }
+  .copy-btn.copied { color: var(--good); border-color: var(--good); }
   .badge-critical { color: var(--critical); background: rgba(208,59,59,0.14); }
 
   .criteria { display: flex; flex-wrap: wrap; gap: 6px; padding-top: 12px; border-top: 1px solid var(--border); }
@@ -513,8 +520,46 @@ function renderTiles() {
           ${chip(v.tokOk, '동시5~10 ≥20tok/s')}
           ${chip(v.errorOk, '에러율≤5%')}
         </div>
+        <div style="margin-top:12px;">
+          <button class="copy-btn" data-label="${d.label}">📋 CSV 복사 (다른 장비 결과 붙여넣기용)</button>
+        </div>
       </div>`;
   }).join('');
+
+  document.querySelectorAll('.copy-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      copyText(labelCsv(btn.dataset.label));
+      const original = btn.textContent;
+      btn.textContent = '✅ 복사됨 — import_result.py에 붙여넣으세요';
+      btn.classList.add('copied');
+      setTimeout(() => { btn.textContent = original; btn.classList.remove('copied'); }, 1800);
+    });
+  });
+}
+
+function labelCsv(label) {
+  const ds = datasets.find(d => d.label === label);
+  if (!ds || !ds.rows.length) return '';
+  const cols = Object.keys(ds.rows[0]);
+  const lines = [cols.join(',')];
+  ds.rows.forEach(r => lines.push(cols.map(c => r[c]).join(',')));
+  return lines.join('\\n');
+}
+
+function copyText(text) {
+  // file:// 페이지에서는 navigator.clipboard가 막히는 경우가 많아 execCommand로 폴백
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'fixed';
+  ta.style.opacity = '0';
+  document.body.appendChild(ta);
+  ta.select();
+  try {
+    document.execCommand('copy');
+  } catch (e) {
+    if (navigator.clipboard) navigator.clipboard.writeText(text);
+  }
+  document.body.removeChild(ta);
 }
 
 function renderChart(canvasId, field, axisLabel) {

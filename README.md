@@ -57,7 +57,7 @@ python benchmark_app.py \
   --results-dir ./results
 ```
 
-끝나면 브라우저에 대시보드가 뜨고, `results/report.pdf`에 채택 판정까지 자동으로 정리된다.
+끝나면 브라우저에 대시보드가 뜨고, `results/report.pdf`에 측정 표가 자동으로 정리된다. 채택 가능/보류 판정은 대시보드에서 확인 가능하다.
 
 ## 사전 준비
 
@@ -126,7 +126,7 @@ python benchmark_app.py \
 2. 📊 동시성 레벨별로 TTFT·처리량·안정성·에러율·RAM 측정
 3. 💾 `results/{label}.csv` 저장
 4. 🖥️ `results/dashboard.html` 자동 생성/갱신 후 브라우저 오픈 — **실행 중에는 "테스트 진행중" 배너만 뜨고 이전 결과는 비워서 보여줌** (오래된 데이터와 혼동 방지)
-5. 📄 `results/report.pdf` 자동 생성 (label별 표 + 채택 가능/보류 판정)
+5. 📄 `results/report.pdf` 자동 생성 (label별 측정 표 + 라벨이 2개 이상이면 장비 비교 섹션)
 
 ## 두 장비(Mac ↔ Windows) 비교하는 법
 
@@ -143,6 +143,15 @@ python benchmark_app.py --url http://localhost:11434/v1/chat/completions ^
 ```
 
 공유 폴더가 없다면, 상대편 장비에서 나온 `{label}.csv` 파일 하나만 복사해 넣어도 다음 실행 때 대시보드가 자동으로 합쳐서 비교해준다.
+
+**파일 전송 없이 텍스트만 복사해서 등록하기** — Windows에서 CSV 파일 자체를 옮기기 번거로우면, 결과 CSV 내용을 열어서 텍스트만 복사한 뒤 Mac에서 붙여넣어도 된다:
+
+```bash
+python import_result.py --label windows_gemma4_12b --results-dir ./results
+# 프롬프트가 뜨면 복사한 CSV 내용을 붙여넣고 Ctrl+D (Windows는 Ctrl+Z 후 Enter)
+```
+
+`{label}.csv`로 저장되고, 그 자리에서 바로 `dashboard.html` / `report.pdf`가 갱신된다.
 
 > [!IMPORTANT]
 > 공정한 비교를 위해 두 장비 모두 **같은 모델 / 같은 quant / 같은 `OLLAMA_NUM_PARALLEL` / 같은 `--concurrency`·`--num-requests`**로 맞춰야 한다. 설정이 다르면 하드웨어 차이가 아니라 설정 차이를 비교하게 된다.
@@ -176,24 +185,25 @@ python benchmark_app.py --url http://localhost:11434/v1/chat/completions ^
 
 ## 채택 판단 기준
 
-다음 세 조건을 **모두** 만족해야 온프레미스 채택 가능으로 판정한다 (`report.pdf`에 label별로 자동 표시):
+다음 세 조건을 **모두** 만족해야 온프레미스 채택 가능으로 판정한다 (`dashboard.html`의 결과 카드에 label별로 자동 표시. `report.pdf`는 결론 없이 측정치만 담는다):
 
 - ✅ TTFT p50 **1초 이하**
 - ✅ 동시 5~10명 구간에서 사용자당(`avg_tok_per_sec`) **20 tok/s 이상**
 - ✅ 에러율 **5% 이하**
 
-하나라도 못 미치면 클라우드 API(Gemini Flash 등) 유지가 ROI상 유리하다고 판정한다.
+하나라도 못 미치면 기준 미달로 표시된다.
 
 ## 폴더 구조
 
 ```
 llm_benchmark_app/
 ├── benchmark_app.py      # 테스트 실행 + CSV 저장 + 대시보드/PDF 자동 생성
+├── import_result.py      # 다른 장비 결과 CSV를 텍스트로 붙여넣어 등록
 ├── README.md
 └── results/
     ├── {label}.csv        # 장비/모델별 실행 결과
-    ├── dashboard.html      # 모든 CSV를 모아 그리는 비교 대시보드
-    └── report.pdf          # label별 표 + 채택 판정 보고서
+    ├── dashboard.html      # 모든 CSV를 모아 그리는 비교 대시보드 (채택 판정 포함)
+    └── report.pdf          # label별 측정 표 + 장비 비교 (판정 없이 수치만)
 ```
 
 ## 동작 원리
@@ -202,9 +212,10 @@ llm_benchmark_app/
 flowchart LR
     A["🔥 워밍업 요청"] --> B["동시성 레벨별 부하 테스트<br/>(TTFT·tok/s·RAM 샘플링)"]
     B --> C["📄 {label}.csv 저장"]
+    C2["✍️ import_result.py<br/>(다른 장비 결과 붙여넣기)"] --> C
     C --> D["results/ 안 모든 CSV 취합"]
-    D --> E["🖥️ dashboard.html"]
-    D --> F["📑 report.pdf<br/>(채택 판정 포함)"]
+    D --> E["🖥️ dashboard.html<br/>(채택 판정 포함)"]
+    D --> F["📑 report.pdf<br/>(측정 표 + 장비 비교)"]
 ```
 
 ## 트러블슈팅
