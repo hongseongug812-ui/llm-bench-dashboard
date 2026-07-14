@@ -418,6 +418,31 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 <div id="runningBanner" class="running"></div>
 
 <div class="panel">
+  <div class="panel-title">🚀 새 테스트 시작</div>
+  <div class="sub" style="margin-bottom:10px;">
+    <code>python server.py</code>로 이 페이지를 띄운 경우에만 동작한다 (파일을 직접 열었다면 동작하지 않는다).
+    실행할 때마다 타임스탬프가 붙은 새 라벨로 저장되므로, 여러 번 눌러도 이전 기록을 덮어쓰지 않고 계속 쌓인다.
+  </div>
+  <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:8px; margin-bottom:10px;">
+    <input id="runUrl" type="text" placeholder="엔드포인트 URL" value="http://localhost:11434/v1/chat/completions"
+           style="background:var(--surface-2); border:1px solid var(--border); color:var(--ink); padding:8px 10px; border-radius:8px; font-family:inherit; font-size:12.5px;">
+    <input id="runModel" type="text" placeholder="모델명" value="gemma4:12b"
+           style="background:var(--surface-2); border:1px solid var(--border); color:var(--ink); padding:8px 10px; border-radius:8px; font-family:inherit; font-size:12.5px;">
+    <input id="runLabel" type="text" placeholder="라벨(선택, 비우면 모델명+시간)"
+           style="background:var(--surface-2); border:1px solid var(--border); color:var(--ink); padding:8px 10px; border-radius:8px; font-family:inherit; font-size:12.5px;">
+    <input id="runConcurrency" type="text" placeholder="동시성" value="1,5,10"
+           style="background:var(--surface-2); border:1px solid var(--border); color:var(--ink); padding:8px 10px; border-radius:8px; font-family:inherit; font-size:12.5px;">
+    <input id="runNumRequests" type="text" placeholder="동시성별 요청 수" value="15"
+           style="background:var(--surface-2); border:1px solid var(--border); color:var(--ink); padding:8px 10px; border-radius:8px; font-family:inherit; font-size:12.5px;">
+  </div>
+  <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+    <button class="copy-btn" id="startRunBtn">▶ 테스트 시작</button>
+    <span id="runStatus" class="sub"></span>
+  </div>
+  <div id="runLog" style="display:none; margin-top:10px; font-family:ui-monospace,monospace; font-size:11.5px; color:var(--ink-2); white-space:pre-wrap; max-height:160px; overflow-y:auto; background:var(--surface-2); padding:8px; border-radius:8px;"></div>
+</div>
+
+<div class="panel">
   <div class="panel-title">📥 결과 요약 — 다른 장비 결과 붙여넣기</div>
   <div class="sub" style="margin-bottom:10px;">
     다른 장비(Windows 등)에서 benchmark_app.py를 실행해 나온 CSV 내용을 그대로 붙여넣으면, 이 화면(차트·비교)에 바로 반영된다.
@@ -786,6 +811,61 @@ document.getElementById('makeReportBtn').addEventListener('click', () => {
   const status = document.getElementById('reportStatus');
   status.textContent = `✅ 복사됨: ${cmd}`;
 });
+
+// "새 테스트 시작" — python server.py로 띄웠을 때만 /api/run, /api/status가 존재함
+let runPollTimer = null;
+
+document.getElementById('startRunBtn').addEventListener('click', async () => {
+  const startBtn = document.getElementById('startRunBtn');
+  const status = document.getElementById('runStatus');
+  const body = {
+    url: document.getElementById('runUrl').value.trim(),
+    model: document.getElementById('runModel').value.trim(),
+    label: document.getElementById('runLabel').value.trim(),
+    concurrency: document.getElementById('runConcurrency').value.trim(),
+    num_requests: document.getElementById('runNumRequests').value.trim(),
+  };
+  status.textContent = '⏳ 요청 중...';
+  try {
+    const res = await fetch('/api/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (!res.ok || !data.ok) {
+      status.textContent = `⚠️ ${data.error || '시작 실패'}`;
+      return;
+    }
+    status.textContent = `⏳ "${data.label}" 실행 중...`;
+    startBtn.disabled = true;
+    pollRunStatus();
+  } catch (e) {
+    status.textContent = '⚠️ 서버에 연결할 수 없습니다 — python server.py로 이 페이지를 띄웠는지 확인하세요 (파일을 직접 열면 동작하지 않음)';
+  }
+});
+
+function pollRunStatus() {
+  clearInterval(runPollTimer);
+  const startBtn = document.getElementById('startRunBtn');
+  const status = document.getElementById('runStatus');
+  const logBox = document.getElementById('runLog');
+  runPollTimer = setInterval(async () => {
+    try {
+      const res = await fetch('/api/status');
+      const data = await res.json();
+      logBox.style.display = 'block';
+      logBox.textContent = (data.log || []).join('\\n');
+      logBox.scrollTop = logBox.scrollHeight;
+      if (!data.running) {
+        clearInterval(runPollTimer);
+        startBtn.disabled = false;
+        status.textContent = data.error ? `⚠️ 에러: ${data.error}` : '✅ 완료 — 잠시 후 새로고침됩니다';
+        if (!data.error) setTimeout(() => location.reload(), 1500);
+      }
+    } catch (e) { /* 일시적 네트워크 오류는 무시하고 다음 폴링에서 재시도 */ }
+  }, 2000);
+}
 
 render();
 </script>
