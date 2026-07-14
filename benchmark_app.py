@@ -301,55 +301,6 @@ def _base_label(label: str) -> str:
     return _TIMESTAMP_SUFFIX_RE.sub("", label)
 
 
-def group_repeated_runs(datasets: list) -> list:
-    """같은 모델/설정을 반복 실행해 라벨 끝에 타임스탬프만 다르게 붙은 결과들을 자동으로 묶어
-    동시성별 중앙값 하나의 대표 데이터셋으로 요약한다 (반복 횟수·TTFT 편차도 같이 담음).
-    10번이고 20번이고 반복해도 대시보드/장비비교 표가 개별 실행 수만큼 늘어나지 않게 하기 위함."""
-    groups: dict = {}
-    order = []
-    for ds in datasets:
-        base = _base_label(ds["label"])
-        if base not in groups:
-            groups[base] = []
-            order.append(base)
-        groups[base].append(ds)
-
-    result = []
-    for base in order:
-        members = groups[base]
-        if len(members) == 1:
-            members[0]["base_label"] = base
-            result.append(members[0])
-            continue
-
-        all_concurrency = sorted({r.get("concurrency") for ds in members for r in ds["rows"]})
-        rep_rows = []
-        ttft_spreads = []
-        for c in all_concurrency:
-            sample_rows = [next((r for r in ds["rows"] if r.get("concurrency") == c), None) for ds in members]
-            sample_rows = [r for r in sample_rows if r is not None]
-            if not sample_rows:
-                continue
-            row = {"concurrency": c}
-            fields = [k for k in sample_rows[0].keys() if k != "concurrency"]
-            for field in fields:
-                vals = [r[field] for r in sample_rows if isinstance(r.get(field), (int, float))]
-                row[field] = round(statistics.median(vals), 3) if vals else "-"
-            ttft_vals = [r["p50_ttft"] for r in sample_rows if isinstance(r.get("p50_ttft"), (int, float))]
-            if len(ttft_vals) > 1:
-                ttft_spreads.append(max(ttft_vals) - min(ttft_vals))
-            rep_rows.append(row)
-
-        result.append({
-            "label": f"{base} (n={len(members)}, 중앙값)",
-            "base_label": base,
-            "rows": rep_rows,
-            "run_count": len(members),
-            "ttft_spread": round(max(ttft_spreads), 3) if ttft_spreads else 0,
-        })
-    return result
-
-
 DEVICE_META_FILENAME = "device_meta.json"
 
 
@@ -380,14 +331,92 @@ def save_device_meta(results_dir: str, base_label: str, spec: str = "", price_kr
     return meta
 
 
+def group_repeated_runs(datasets: list, results_dir: str = None) -> list:
+    """반복 실행된 결과를 하나의 대표 데이터셋(동시성별 중앙값)으로 묶는다.
+
+    묶는 기준은 두 단계:
+    1) device_meta.json에 자동 감지된 사양(spec)이 있으면 그 사양이 같은 결과끼리 묶는다
+       — 라벨 이름이 달라도(예: 'mac_gemma4_12b' vs 'gemma4_12b_20260714_...') 같은 물리 장비면 하나로 합쳐짐.
+    2) 사양 정보가 없는 옛 결과는 기존처럼 라벨의 타임스탬프(_YYYYMMDD_HHMMSS)를 뗀 이름으로 묶는다.
+    실제로 다른 장비(예: Windows)는 감지된 사양 자체가 다르므로 자동으로 별개로 남는다."""
+    meta = load_device_meta(results_dir) if results_dir else {}
+
+    def group_key(label):
+        base = _base_label(label)
+        spec = (meta.get(base) or {}).get("spec")
+        return f"spec:{spec.strip().lower()}" if spec else f"label:{base}"
+
+    groups: dict = {}
+    order = []
+    for ds in datasets:
+        base = _base_label(ds["label"])
+        key = group_key(ds["label"])
+        if key not in groups:
+            groups[key] = {"members": [], "base_labels": []}
+            order.append(key)
+        groups[key]["members"].append(ds)
+        groups[key]["base_labels"].append(base)
+
+    result = []
+    for key in order:
+        members = groups[key]["members"]
+        base_labels = groups[key]["base_labels"]
+        rep_base = max(set(base_labels), key=base_labels.count)  # 가장 많이 등장한 라벨 이름을 대표로 사용
+
+        if len(members) == 1:
+            members[0]["base_label"] = rep_base
+            members[0]["member_base_labels"] = list(set(base_labels))
+            result.append(members[0])
+            continue
+
+        all_concurrency = sorted({r.get("concurrency") for ds in members for r in ds["rows"]})
+        rep_rows = []
+        ttft_spreads = []
+        for c in all_concurrency:
+            sample_rows = [next((r for r in ds["rows"] if r.get("concurrency") == c), None) for ds in members]
+            sample_rows = [r for r in sample_rows if r is not None]
+            if not sample_rows:
+                continue
+            row = {"concurrency": c}
+            fields = [k for k in sample_rows[0].keys() if k != "concurrency"]
+            for field in fields:
+                vals = [r[field] for r in sample_rows if isinstance(r.get(field), (int, float))]
+                row[field] = round(statistics.median(vals), 3) if vals else "-"
+            ttft_vals = [r["p50_ttft"] for r in sample_rows if isinstance(r.get("p50_ttft"), (int, float))]
+            if len(ttft_vals) > 1:
+                ttft_spreads.append(max(ttft_vals) - min(ttft_vals))
+            rep_rows.append(row)
+
+        result.append({
+            "label": f"{rep_base} (n={len(members)}, 중앙값)",
+            "base_label": rep_base,
+            "member_base_labels": list(set(base_labels)),
+            "rows": rep_rows,
+            "run_count": len(members),
+            "ttft_spread": round(max(ttft_spreads), 3) if ttft_spreads else 0,
+        })
+    return result
+
+
 def attach_device_meta(datasets: list, results_dir: str) -> list:
-    """데이터셋마다 base_label로 device_meta.json을 찾아 spec/price_krw를 붙임"""
+    """데이터셋마다 member_base_labels로 device_meta.json을 찾아 spec/price_krw를 붙임.
+    같은 그룹 안에 여러 base_label이 섞여 있고 사양/가격이 서로 다른 라벨에 나뉘어 저장된 경우
+    (예: spec은 'gemma4_12b'에, price는 'mac_gemma4_12b'에) 첫 매치만 쓰지 않고 전부 합친다."""
     meta = load_device_meta(results_dir)
     for ds in datasets:
-        entry = meta.get(ds.get("base_label", ds["label"]))
-        if entry:
-            ds["spec"] = entry.get("spec", "")
-            ds["price_krw"] = entry.get("price_krw")
+        candidates = ds.get("member_base_labels") or [ds.get("base_label", ds["label"])]
+        spec, price_krw = "", None
+        for cand in candidates:
+            entry = meta.get(cand)
+            if not entry:
+                continue
+            spec = spec or entry.get("spec", "")
+            if price_krw is None:
+                price_krw = entry.get("price_krw")
+        if spec:
+            ds["spec"] = spec
+        if price_krw is not None:
+            ds["price_krw"] = price_krw
     return datasets
 
 
@@ -1156,7 +1185,7 @@ def compare_devices(datasets: list) -> dict:
 
 def generate_pdf_report(results_dir: str) -> str:
     """결과 폴더의 모든 CSV를 모아 label별 표 + 채택 판정을 담은 report.pdf 생성"""
-    datasets = attach_device_meta(group_repeated_runs(load_all_results(results_dir)), results_dir)
+    datasets = attach_device_meta(group_repeated_runs(load_all_results(results_dir), results_dir), results_dir)
     out_path = os.path.join(results_dir, "report.pdf")
 
     styles = {
@@ -1323,7 +1352,7 @@ def generate_pdf_report(results_dir: str) -> str:
 
 def generate_dashboard(results_dir: str, running_label: str = None) -> str:
     """running_label을 넘기면 진행중 배너만 표시하고 기존 데이터는 비워서 보여줌(진행 중인 실행과 과거 결과 혼동 방지)"""
-    datasets = [] if running_label else attach_device_meta(group_repeated_runs(load_all_results(results_dir)), results_dir)
+    datasets = [] if running_label else attach_device_meta(group_repeated_runs(load_all_results(results_dir), results_dir), results_dir)
     html = (
         DASHBOARD_TEMPLATE
         .replace("__EMBEDDED_DATA__", json.dumps(datasets, ensure_ascii=False))
