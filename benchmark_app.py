@@ -632,7 +632,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
   <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:8px; margin-bottom:10px;">
     <select id="priceLabelSelect"
             style="background:var(--surface-2); border:1px solid var(--border); color:var(--ink); padding:8px 10px; border-radius:8px; font-family:inherit; font-size:12.5px;"></select>
-    <input id="priceKrw" type="number" placeholder="구매가(원)"
+    <input id="priceKrw" type="number" placeholder="구매가($)"
            style="background:var(--surface-2); border:1px solid var(--border); color:var(--ink); padding:8px 10px; border-radius:8px; font-family:inherit; font-size:12.5px;">
   </div>
   <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
@@ -871,18 +871,18 @@ function renderPricePanel() {
   const items = priced.map(d => {
     const tok = realisticThroughput(d.rows);
     const score = efficiencyScore(d.rows);
-    const perManwon = score / (d.price_krw / 10000);
-    return { label: d.label, spec: d.spec || '', price: d.price_krw, tok, score, perManwon };
-  }).sort((a, b) => b.perManwon - a.perManwon);
+    const per100usd = score / (d.price_krw / 100);
+    return { label: d.label, spec: d.spec || '', price: d.price_krw, tok, score, per100usd };
+  }).sort((a, b) => b.per100usd - a.per100usd);
 
   const rows = items.map((it, i) => `
     <tr>
       <td>${i === 0 ? '<span class="medal">🏆</span>' : ''}${it.label}</td>
       <td>${it.spec || '-'}</td>
-      <td>${it.price.toLocaleString()}원</td>
+      <td>$${it.price.toLocaleString()}</td>
       <td>${it.tok.toFixed(1)}</td>
       <td>${it.score.toFixed(2)}</td>
-      <td class="${i === 0 ? 'win-cell' : ''}">${it.perManwon.toFixed(3)}</td>
+      <td class="${i === 0 ? 'win-cell' : ''}">${it.per100usd.toFixed(3)}</td>
     </tr>`).join('');
 
   panel.innerHTML = `
@@ -890,11 +890,11 @@ function renderPricePanel() {
     <div class="compare-headline">
       <span class="crown">🏆</span>
       <b>${items[0].label} 가성비 우세</b>
-      <span class="sub">(만원당 효율점수 ${items[0].perManwon.toFixed(3)} — 동시 5~10명 구간의 처리량÷TTFT 기준. 에러율 5% 초과 장비는 제외)</span>
+      <span class="sub">(100달러당 효율점수 ${items[0].per100usd.toFixed(3)} — 동시 5~10명 구간의 처리량÷TTFT 기준. 에러율 5% 초과 장비는 제외)</span>
     </div>
     <div class="table-wrap">
       <table class="compare-table">
-        <thead><tr><th>장비</th><th>사양</th><th>구매가</th><th>실사용 처리량(tok/s)</th><th>효율점수(처리량÷TTFT)</th><th>만원당 효율점수</th></tr></thead>
+        <thead><tr><th>장비</th><th>사양</th><th>구매가</th><th>실사용 처리량(tok/s)</th><th>효율점수(처리량÷TTFT)</th><th>100달러당 효율점수</th></tr></thead>
         <tbody>${rows}</tbody>
       </table>
     </div>`;
@@ -924,7 +924,7 @@ function renderTiles() {
           <span class="badge ${v.ok ? 'badge-good' : 'badge-critical'}">${v.ok ? '채택 가능' : '채택 보류'}</span>
         </div>
         ${d.run_count > 1 ? `<div class="sub" style="margin-bottom:4px;">🔁 ${d.run_count}회 반복 실행의 중앙값 (TTFT 편차 최대 ±${d.ttft_spread}s)</div>` : ''}
-        ${(d.spec || d.price_krw) ? `<div class="sub" style="margin-bottom:10px;">${d.spec ? `🔧 ${d.spec}` : ''}${d.spec && d.price_krw ? ' · ' : ''}${d.price_krw ? `💰 ${Number(d.price_krw).toLocaleString()}원` : ''}</div>` : ''}
+        ${(d.spec || d.price_krw) ? `<div class="sub" style="margin-bottom:10px;">${d.spec ? `🔧 ${d.spec}` : ''}${d.spec && d.price_krw ? ' · ' : ''}${d.price_krw ? `💰 $${Number(d.price_krw).toLocaleString()}` : ''}</div>` : ''}
         <div class="tile-stats">
           <div>
             <div class="tile-stat-value">${bestTok.toFixed(1)}</div>
@@ -1275,7 +1275,7 @@ def _efficiency_score(rows: list) -> float:
 
 def compute_price_efficiency(datasets: list) -> list:
     """가격이 입력되고 에러율 기준(≤5%, 채택 판단 기준과 동일)을 통과한 장비가 2개 이상일 때,
-    만원당 효율성 점수(처리량÷TTFT) 기준으로 정렬한 목록을 만듦."""
+    100달러당 효율성 점수(처리량÷TTFT) 기준으로 정렬한 목록을 만듦. (가격은 달러 기준으로 입력)"""
     def error_ok(ds):
         return all((r.get("error_rate", 100) or 0) <= 5.0 for r in ds["rows"])
 
@@ -1290,9 +1290,9 @@ def compute_price_efficiency(datasets: list) -> list:
         items.append({
             "label": ds["label"], "spec": ds.get("spec", ""), "price": ds["price_krw"],
             "tok": round(tok, 1), "score": round(score, 2),
-            "per_manwon": round(score / (ds["price_krw"] / 10000), 3),
+            "per_100usd": round(score / (ds["price_krw"] / 100), 3),
         })
-    items.sort(key=lambda it: it["per_manwon"], reverse=True)
+    items.sort(key=lambda it: it["per_100usd"], reverse=True)
     return items
 
 
@@ -1469,13 +1469,13 @@ def generate_pdf_report(results_dir: str) -> str:
                 story.append(Paragraph("가격 대비 성능", styles["h2"]))
                 story.append(Paragraph(
                     f"{price_items[0]['label']} 가성비 우세 "
-                    f"(만원당 효율점수 {price_items[0]['per_manwon']} — 동시 5~10명 실사용 구간의 처리량÷TTFT 기준. "
+                    f"(100달러당 효율점수 {price_items[0]['per_100usd']} — 동시 5~10명 실사용 구간의 처리량÷TTFT 기준. "
                     "에러율 5% 초과 장비는 비교에서 제외됨)",
                     styles["verdict_ok"]))
                 price_header = [Paragraph(h, header_style) for h in
-                                ["장비", "사양", "구매가", "실사용 처리량(tok/s)", "효율점수(처리량÷TTFT)", "만원당 효율점수"]]
+                                ["장비", "사양", "구매가", "실사용 처리량(tok/s)", "효율점수(처리량÷TTFT)", "100달러당 효율점수"]]
                 price_data = [price_header] + [
-                    [it["label"], it["spec"] or "-", f"{it['price']:,.0f}원", it["tok"], it["score"], it["per_manwon"]]
+                    [it["label"], it["spec"] or "-", f"${it['price']:,.0f}", it["tok"], it["score"], it["per_100usd"]]
                     for it in price_items
                 ]
                 price_table = Table(price_data, colWidths=[45 * mm, 55 * mm, 30 * mm, 40 * mm, 45 * mm, 40 * mm])
