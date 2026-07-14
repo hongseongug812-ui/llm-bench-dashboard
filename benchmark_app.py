@@ -33,6 +33,7 @@ import platform
 import re
 import shutil
 import statistics
+import subprocess
 import time
 import webbrowser
 
@@ -317,6 +318,7 @@ def group_repeated_runs(datasets: list) -> list:
     for base in order:
         members = groups[base]
         if len(members) == 1:
+            members[0]["base_label"] = base
             result.append(members[0])
             continue
 
@@ -340,11 +342,87 @@ def group_repeated_runs(datasets: list) -> list:
 
         result.append({
             "label": f"{base} (n={len(members)}, 중앙값)",
+            "base_label": base,
             "rows": rep_rows,
             "run_count": len(members),
             "ttft_spread": round(max(ttft_spreads), 3) if ttft_spreads else 0,
         })
     return result
+
+
+DEVICE_META_FILENAME = "device_meta.json"
+
+
+def load_device_meta(results_dir: str) -> dict:
+    """장비별 사양·구매가 메타데이터(results/device_meta.json)를 읽음. base_label 기준으로 저장됨."""
+    path = os.path.join(results_dir, DEVICE_META_FILENAME)
+    if not os.path.exists(path):
+        return {}
+    with open(path, encoding="utf-8") as f:
+        try:
+            return json.load(f)
+        except json.JSONDecodeError:
+            return {}
+
+
+def save_device_meta(results_dir: str, base_label: str, spec: str = "", price_krw: float | None = None) -> dict:
+    """장비 사양/구매가를 base_label 기준으로 저장 — 같은 장비의 반복 실행은 하나의 가격만 공유"""
+    path = os.path.join(results_dir, DEVICE_META_FILENAME)
+    meta = load_device_meta(results_dir)
+    entry = meta.get(base_label, {})
+    if spec:
+        entry["spec"] = spec
+    if price_krw is not None:
+        entry["price_krw"] = price_krw
+    meta[base_label] = entry
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+    return meta
+
+
+def attach_device_meta(datasets: list, results_dir: str) -> list:
+    """데이터셋마다 base_label로 device_meta.json을 찾아 spec/price_krw를 붙임"""
+    meta = load_device_meta(results_dir)
+    for ds in datasets:
+        entry = meta.get(ds.get("base_label", ds["label"]))
+        if entry:
+            ds["spec"] = entry.get("spec", "")
+            ds["price_krw"] = entry.get("price_krw")
+    return datasets
+
+
+def detect_spec() -> str:
+    """이 스크립트가 실제로 돌아가고 있는 장비의 칩/GPU·RAM 사양을 자동으로 감지 (사용자가 직접 입력할 필요 없음)"""
+    ram_gb = round(psutil.virtual_memory().total / (1024 ** 3))
+    system = platform.system()
+
+    if system == "Darwin":
+        chip = ""
+        try:
+            out = subprocess.run(["system_profiler", "SPHardwareDataType"],
+                                  capture_output=True, text=True, timeout=5).stdout
+            for line in out.splitlines():
+                if "Chip:" in line:
+                    chip = line.split(":", 1)[1].strip()
+                    break
+        except Exception:
+            pass
+        return f"Mac ({chip or 'Apple Silicon'}) · RAM {ram_gb}GB"
+
+    if system == "Windows":
+        cpu = platform.processor() or ""
+        gpu = ""
+        if shutil.which("nvidia-smi"):
+            try:
+                out = subprocess.run(["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                                      capture_output=True, text=True, timeout=5).stdout
+                gpu = out.strip().splitlines()[0] if out.strip() else ""
+            except Exception:
+                pass
+        parts = [p for p in [gpu, cpu] if p]
+        return f"Windows ({' + '.join(parts)}) · RAM {ram_gb}GB" if parts else f"Windows · RAM {ram_gb}GB"
+
+    return f"{system} · RAM {ram_gb}GB"
 
 
 DASHBOARD_TEMPLATE = """<!DOCTYPE html>
@@ -500,6 +578,24 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 </div>
 
 <div class="panel">
+  <div class="panel-title">💰 장비 구매가 입력</div>
+  <div class="sub" style="margin-bottom:10px;">
+    사양(칩/GPU·RAM)은 "테스트 시작"으로 벤치마크를 돌릴 때 그 장비에서 자동으로 감지되어 붙는다 — 여기서는 가격만 입력하면 된다.
+    <code>python server.py</code>로 띄운 경우에만 저장되고, 장비 하나당 가격은 한 번만 입력하면 반복 실행해도 계속 붙는다(라벨의 타임스탬프를 뗀 기본 이름 기준).
+  </div>
+  <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:8px; margin-bottom:10px;">
+    <select id="priceLabelSelect"
+            style="background:var(--surface-2); border:1px solid var(--border); color:var(--ink); padding:8px 10px; border-radius:8px; font-family:inherit; font-size:12.5px;"></select>
+    <input id="priceKrw" type="number" placeholder="구매가(원)"
+           style="background:var(--surface-2); border:1px solid var(--border); color:var(--ink); padding:8px 10px; border-radius:8px; font-family:inherit; font-size:12.5px;">
+  </div>
+  <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+    <button class="copy-btn" id="savePriceBtn">💾 저장</button>
+    <span id="priceStatus" class="sub"></span>
+  </div>
+</div>
+
+<div class="panel">
   <div class="panel-title">📥 결과 요약 — 다른 장비 결과 붙여넣기</div>
   <div class="sub" style="margin-bottom:10px;">
     다른 장비(Windows 등)에서 benchmark_app.py를 실행해 나온 CSV 내용을 그대로 붙여넣으면, 이 화면(차트·비교)에 바로 반영된다.
@@ -534,6 +630,7 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
 
 <div id="content">
   <div id="comparePanel" class="panel" style="display:none;"></div>
+  <div id="pricePanel" class="panel" style="display:none;"></div>
 
   <div id="tiles" class="tiles"></div>
 
@@ -618,8 +715,10 @@ function render() {
   banner.style.display = 'none';
   document.getElementById('emptyState').style.display = datasets.length ? 'none' : 'block';
   document.getElementById('content').style.display = datasets.length ? 'block' : 'none';
+  populatePriceLabelSelect();
   if (!datasets.length) return;
   renderComparison();
+  renderPricePanel();
   renderTiles();
   renderChart('ttftChart', 'p50_ttft', 'TTFT (s)');
   renderChart('tokChart', 'aggregate_tok_per_sec', 'tok/s');
@@ -692,6 +791,52 @@ function renderComparison() {
     </div>`;
 }
 
+// 가격이 입력된 장비가 2개 이상일 때, 구매가 대비 처리량(가성비)을 비교
+function renderPricePanel() {
+  const panel = document.getElementById('pricePanel');
+  const priced = datasets.filter(d => typeof d.price_krw === 'number' && d.price_krw > 0);
+  if (priced.length < 2) { panel.style.display = 'none'; return; }
+  panel.style.display = 'block';
+
+  const items = priced.map(d => {
+    const bestTok = Math.max(...d.rows.map(r => r.aggregate_tok_per_sec || 0));
+    const perManwon = bestTok / (d.price_krw / 10000);
+    return { label: d.label, spec: d.spec || '', price: d.price_krw, bestTok, perManwon };
+  }).sort((a, b) => b.perManwon - a.perManwon);
+
+  const rows = items.map((it, i) => `
+    <tr>
+      <td>${i === 0 ? '<span class="medal">🏆</span>' : ''}${it.label}</td>
+      <td>${it.spec || '-'}</td>
+      <td>${it.price.toLocaleString()}원</td>
+      <td>${it.bestTok.toFixed(1)}</td>
+      <td class="${i === 0 ? 'win-cell' : ''}">${it.perManwon.toFixed(2)}</td>
+    </tr>`).join('');
+
+  panel.innerHTML = `
+    <div class="panel-title">💰 가격 대비 성능</div>
+    <div class="compare-headline">
+      <span class="crown">🏆</span>
+      <b>${items[0].label} 가성비 우세</b>
+      <span class="sub">(만원당 ${items[0].perManwon.toFixed(2)} tok/s — 최대 처리량 기준)</span>
+    </div>
+    <div class="table-wrap">
+      <table class="compare-table">
+        <thead><tr><th>장비</th><th>사양</th><th>구매가</th><th>최대 처리량(tok/s)</th><th>만원당 tok/s</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>`;
+}
+
+function populatePriceLabelSelect() {
+  const select = document.getElementById('priceLabelSelect');
+  if (!select) return;
+  const bases = [...new Set(datasets.map(d => d.base_label || d.label))];
+  select.innerHTML = bases.length
+    ? bases.map(b => `<option value="${b}">${b}</option>`).join('')
+    : '<option value="">등록된 결과가 없습니다</option>';
+}
+
 function renderTiles() {
   document.getElementById('tiles').innerHTML = datasets.map((d, i) => {
     const rows = d.rows;
@@ -706,7 +851,8 @@ function renderTiles() {
           <span style="color:${color};font-weight:600;">● ${d.label}</span>
           <span class="badge ${v.ok ? 'badge-good' : 'badge-critical'}">${v.ok ? '채택 가능' : '채택 보류'}</span>
         </div>
-        ${d.run_count > 1 ? `<div class="sub" style="margin-bottom:10px;">🔁 ${d.run_count}회 반복 실행의 중앙값 (TTFT 편차 최대 ±${d.ttft_spread}s)</div>` : ''}
+        ${d.run_count > 1 ? `<div class="sub" style="margin-bottom:4px;">🔁 ${d.run_count}회 반복 실행의 중앙값 (TTFT 편차 최대 ±${d.ttft_spread}s)</div>` : ''}
+        ${(d.spec || d.price_krw) ? `<div class="sub" style="margin-bottom:10px;">${d.spec ? `🔧 ${d.spec}` : ''}${d.spec && d.price_krw ? ' · ' : ''}${d.price_krw ? `💰 ${Number(d.price_krw).toLocaleString()}원` : ''}</div>` : ''}
         <div class="tile-stats">
           <div>
             <div class="tile-stat-value">${bestTok.toFixed(1)}</div>
@@ -882,6 +1028,27 @@ document.getElementById('makeReportBtn').addEventListener('click', () => {
   status.textContent = `✅ 복사됨: ${cmd}`;
 });
 
+document.getElementById('savePriceBtn').addEventListener('click', async () => {
+  const status = document.getElementById('priceStatus');
+  const label = document.getElementById('priceLabelSelect').value;
+  const priceStr = document.getElementById('priceKrw').value.trim();
+  if (!label) { status.textContent = '⚠️ 저장할 장비가 없습니다 (결과가 먼저 있어야 함)'; return; }
+  if (!priceStr) { status.textContent = '⚠️ 가격을 입력하세요'; return; }
+  try {
+    const res = await fetch('/api/set-meta', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ label, price_krw: Number(priceStr) }),
+    });
+    const data = await res.json();
+    if (!res.ok || !data.ok) { status.textContent = `⚠️ ${data.error || '저장 실패'}`; return; }
+    status.textContent = `✅ "${label}" 가격 저장됨 — 새로고침합니다`;
+    setTimeout(() => location.reload(), 1000);
+  } catch (e) {
+    status.textContent = '⚠️ 서버에 연결할 수 없습니다 — python server.py로 이 페이지를 띄웠는지 확인하세요';
+  }
+});
+
 // "새 테스트 시작" — python server.py로 띄웠을 때만 /api/run, /api/status가 존재함
 let runPollTimer = null;
 
@@ -989,7 +1156,7 @@ def compare_devices(datasets: list) -> dict:
 
 def generate_pdf_report(results_dir: str) -> str:
     """결과 폴더의 모든 CSV를 모아 label별 표 + 채택 판정을 담은 report.pdf 생성"""
-    datasets = group_repeated_runs(load_all_results(results_dir))
+    datasets = attach_device_meta(group_repeated_runs(load_all_results(results_dir)), results_dir)
     out_path = os.path.join(results_dir, "report.pdf")
 
     styles = {
@@ -1156,7 +1323,7 @@ def generate_pdf_report(results_dir: str) -> str:
 
 def generate_dashboard(results_dir: str, running_label: str = None) -> str:
     """running_label을 넘기면 진행중 배너만 표시하고 기존 데이터는 비워서 보여줌(진행 중인 실행과 과거 결과 혼동 방지)"""
-    datasets = [] if running_label else group_repeated_runs(load_all_results(results_dir))
+    datasets = [] if running_label else attach_device_meta(group_repeated_runs(load_all_results(results_dir)), results_dir)
     html = (
         DASHBOARD_TEMPLATE
         .replace("__EMBEDDED_DATA__", json.dumps(datasets, ensure_ascii=False))
@@ -1195,6 +1362,11 @@ def main():
               "전력 소모량을 측정하려면 'sudo python benchmark_app.py ...'로 재실행. 지금은 '-'로 표기됨")
     else:
         print("[전력 측정] nvidia-smi를 찾을 수 없어 전력 소모량은 '-'로 표기됨")
+
+    try:
+        save_device_meta(results_dir, _base_label(args.label), spec=detect_spec())
+    except Exception as e:
+        print(f"[사양 감지 실패, 무시하고 진행] {e}")
 
     dashboard_path = generate_dashboard(results_dir, running_label=args.label)
     if not args.no_browser:

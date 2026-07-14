@@ -22,10 +22,12 @@ from flask import Flask, jsonify, request, send_from_directory
 
 from benchmark_app import (
     DEFAULT_PROMPT,
+    detect_spec,
     generate_dashboard,
     generate_pdf_report,
     run_benchmark,
     save_csv,
+    save_device_meta,
 )
 
 app = Flask(__name__)
@@ -113,6 +115,10 @@ def api_run():
         STATE["label"] = label
 
     results_dir = app.config["RESULTS_DIR"]
+    try:
+        save_device_meta(results_dir, base_label, spec=detect_spec())
+    except Exception as e:
+        _log(f"[사양 감지 실패, 무시하고 진행] {e}")
     generate_dashboard(results_dir, running_label=label)
 
     thread = threading.Thread(
@@ -122,6 +128,25 @@ def api_run():
     )
     thread.start()
     return jsonify({"ok": True, "label": label})
+
+
+@app.route("/api/set-meta", methods=["POST"])
+def api_set_meta():
+    data = request.get_json(force=True, silent=True) or {}
+    label = (data.get("label") or "").strip()
+    if not label:
+        return jsonify({"ok": False, "error": "label이 필요합니다"}), 400
+    spec = (data.get("spec") or "").strip()
+    price_krw = data.get("price_krw")
+    try:
+        price_krw = float(price_krw) if price_krw is not None else None
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "price_krw는 숫자여야 합니다"}), 400
+
+    results_dir = app.config["RESULTS_DIR"]
+    save_device_meta(results_dir, label, spec=spec, price_krw=price_krw)
+    generate_dashboard(results_dir)
+    return jsonify({"ok": True})
 
 
 @app.route("/api/make-report", methods=["POST"])
