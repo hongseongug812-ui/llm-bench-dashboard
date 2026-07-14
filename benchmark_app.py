@@ -645,8 +645,9 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
   <div class="panel-title">📥 결과 요약 — 다른 장비 결과 붙여넣기</div>
   <div class="sub" style="margin-bottom:10px;">
     다른 장비(Windows 등)에서 benchmark_app.py를 실행해 나온 CSV 내용을 그대로 붙여넣으면, 이 화면(차트·비교)에 바로 반영된다.
-    파일 전송은 필요 없다. 단, 이건 <b>이 브라우저 화면에서만 보이는 미리보기</b>이며 새로고침하면 사라진다 —
-    나중에도 남기려면 "CSV 다운로드"로 저장한 뒤 <code>results/</code> 폴더에 넣어라.
+    파일 전송은 필요 없다. "➕ 비교에 추가"는 <b>이 브라우저 화면에서만 보이는 미리보기</b>(새로고침하면 사라짐)이고,
+    <code>python server.py</code>로 띄운 경우에는 "💾 서버에 저장"으로 바로 <code>results/</code>에 저장해서
+    그래프·PDF 보고서에도 남길 수 있다.
   </div>
   <div style="display:flex; gap:10px; flex-wrap:wrap; margin-bottom:10px;">
     <input id="pasteLabel" type="text" placeholder="라벨 (예: windows_gemma4_12b)"
@@ -656,7 +657,8 @@ DASHBOARD_TEMPLATE = """<!DOCTYPE html>
             style="width:100%; background:var(--surface-2); border:1px solid var(--border); color:var(--ink); padding:10px; border-radius:8px; font-family:ui-monospace,monospace; font-size:12px; resize:vertical;"></textarea>
   <div style="display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; align-items:center;">
     <button class="copy-btn" id="addResultBtn">➕ 비교에 추가 (미리보기)</button>
-    <button class="copy-btn" id="downloadCsvBtn">💾 CSV 다운로드</button>
+    <button class="copy-btn" id="saveResultBtn">💾 서버에 저장 (보고서에 반영)</button>
+    <button class="copy-btn" id="downloadCsvBtn">📥 CSV 다운로드</button>
     <span id="pasteStatus" class="sub"></span>
   </div>
 </div>
@@ -1065,6 +1067,27 @@ document.getElementById('downloadCsvBtn').addEventListener('click', () => {
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
   status.textContent = `💾 "${label}.csv" 다운로드됨 — results/ 폴더로 옮겨넣어라.`;
+});
+
+document.getElementById('saveResultBtn').addEventListener('click', async () => {
+  const label = document.getElementById('pasteLabel').value.trim();
+  const text = document.getElementById('pasteCsv').value;
+  const status = document.getElementById('pasteStatus');
+  if (!label) { status.textContent = '⚠️ 라벨(장비 이름)을 먼저 입력하세요'; return; }
+  if (!text.trim()) { status.textContent = '⚠️ CSV 내용을 붙여넣으세요'; return; }
+  try {
+    const res = await fetch('/api/import-csv', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ label, csv_text: text }),
+    });
+    const data = await res.json();
+    if (!res.ok || !data.ok) { status.textContent = `⚠️ ${data.error || '저장 실패'}`; return; }
+    status.textContent = `✅ "${label}" 서버에 저장됨 — 새로고침합니다`;
+    setTimeout(() => location.reload(), 1000);
+  } catch (e) {
+    status.textContent = '⚠️ 서버에 연결할 수 없습니다 — python server.py로 이 페이지를 띄웠는지 확인하세요 (파일을 직접 열면 "비교에 추가"만 가능)';
+  }
 });
 
 document.getElementById('makeReportBtn').addEventListener('click', () => {

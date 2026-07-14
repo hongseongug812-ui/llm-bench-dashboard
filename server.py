@@ -13,6 +13,8 @@ benchmark_app.py를 매번 터미널에서 실행하는 대신, 이 서버를 �
 
 import argparse
 import asyncio
+import csv
+import io
 import os
 import threading
 import time
@@ -128,6 +130,31 @@ def api_run():
     )
     thread.start()
     return jsonify({"ok": True, "label": label})
+
+
+@app.route("/api/import-csv", methods=["POST"])
+def api_import_csv():
+    """대시보드의 '결과 요약' 붙여넣기 패널에서 온 CSV 텍스트를 results/{label}.csv로 저장.
+    파일 전송이나 별도 터미널 명령 없이, 붙여넣은 결과를 그래프·PDF 보고서에 실제로 반영시키기 위함."""
+    data = request.get_json(force=True, silent=True) or {}
+    label = (data.get("label") or "").strip()
+    csv_text = data.get("csv_text") or ""
+    if not label:
+        return jsonify({"ok": False, "error": "label이 필요합니다"}), 400
+
+    rows = list(csv.DictReader(io.StringIO(csv_text)))
+    if not rows:
+        return jsonify({"ok": False, "error": "CSV 내용이 비어있거나 형식이 아닙니다"}), 400
+
+    results_dir = app.config["RESULTS_DIR"]
+    out_path = os.path.join(results_dir, f"{label}.csv")
+    with open(out_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    generate_dashboard(results_dir)
+    return jsonify({"ok": True, "path": out_path, "rows": len(rows)})
 
 
 @app.route("/api/set-meta", methods=["POST"])
