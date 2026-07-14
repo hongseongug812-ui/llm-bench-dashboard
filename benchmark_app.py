@@ -762,6 +762,49 @@ def generate_pdf_report(results_dir: str) -> str:
                   styles["meta"]),
     ]
 
+    story.append(Paragraph("참고: Mac(Apple Silicon) vs Windows(Nvidia GPU) 아키텍처 개요", styles["h2"]))
+    story.append(Paragraph(
+        "아래는 일반적으로 알려진 하드웨어 아키텍처 특성이며, 이 보고서가 실측한 수치가 아니다. "
+        "실제 성능·전력 수치는 뒤의 측정 결과를 따른다.",
+        styles["meta"]))
+    arch_header_style = ParagraphStyle("archHeader", fontName=PDF_FONT_BOLD, fontSize=9.5,
+                                        textColor=colors.white, alignment=1, leading=12)
+    arch_body_style = ParagraphStyle("archBody", fontName=PDF_FONT, fontSize=9, leading=13)
+    arch_data = [
+        [Paragraph("", arch_header_style), Paragraph("Mac (Apple Silicon, 통합 메모리)", arch_header_style),
+         Paragraph("Windows (Nvidia GPU, CUDA)", arch_header_style)],
+        [Paragraph("장점", arch_header_style),
+         Paragraph("CPU·GPU가 메모리를 공유(Unified Memory)해 VRAM 제약이 없음 — "
+                   "70B급 이상 대형 모델도 상대적으로 저렴하게 로컬 구동 가능", arch_body_style),
+         Paragraph("CUDA + TensorRT-LLM 등 성숙한 생태계로 순수 연산 처리량이 높고, "
+                   "추론 최적화 도구 지원이 폭넓음", arch_body_style)],
+        [Paragraph("단점", arch_header_style),
+         Paragraph("순수 행렬연산 처리량은 CUDA 전용 가속 대비 낮은 경향이 있고, "
+                   "추론 최적화 생태계가 상대적으로 좁음", arch_body_style),
+         Paragraph("모델 크기가 GPU의 물리적 VRAM 용량에 묶여, 큰 모델을 돌리려면 "
+                   "고VRAM 고가 GPU(또는 다중 GPU)가 필요", arch_body_style)],
+    ]
+    arch_table = Table(arch_data, colWidths=[20 * mm, 124 * mm, 124 * mm])
+    arch_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2a2e3a")),
+        ("BACKGROUND", (0, 1), (0, -1), colors.HexColor("#2a2e3a")),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cccccc")),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 8),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ("ROWBACKGROUNDS", (1, 1), (-1, -1), [colors.white, colors.HexColor("#f5f5f5")]),
+    ]))
+    story.append(arch_table)
+    story.append(Spacer(1, 6 * mm))
+    story.append(Paragraph(
+        "참고 — 파인튜닝(학습): 모델을 직접 파인튜닝할 계획이 있다면 CUDA 생태계(Windows/Linux + Nvidia)가 "
+        "도구·라이브러리 지원 면에서 유리하다. 이 보고서의 측정 범위는 추론(inference) 성능이며, "
+        "파인튜닝 성능은 별도 검증이 필요하다.",
+        styles["body"]))
+    story.append(Spacer(1, 8 * mm))
+
     if not datasets:
         story.append(Paragraph("결과 CSV가 없습니다. 먼저 벤치마크를 실행하세요.", styles["body"]))
     else:
