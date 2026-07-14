@@ -840,25 +840,39 @@ function renderComparison() {
 }
 
 // 가격이 입력된 장비가 2개 이상일 때, 구매가 대비 처리량(가성비)을 비교
-// 채택 판단 기준과 같은 "동시 5~10명" 구간 평균을 실사용 처리량으로 사용 — 특정 동시성에서
-// 우연히 튄 최댓값 하나로 가성비가 왜곡되는 것을 피하기 위함(순간 최대치가 아니라 실사용 구간 기준)
-function realisticThroughput(rows) {
-  const mid = rows.filter(r => r.concurrency >= 5 && r.concurrency <= 10 && typeof r.aggregate_tok_per_sec === 'number');
-  if (mid.length) return mid.reduce((s, r) => s + r.aggregate_tok_per_sec, 0) / mid.length;
-  const all = rows.map(r => r.aggregate_tok_per_sec || 0);
-  return all.length ? Math.max(...all) : 0;
+// 채택 판단 기준과 같은 "동시 5~10명" 구간 평균 — 특정 동시성에서 우연히 튄 값 하나로
+// 지표가 왜곡되는 것을 피하기 위함. 해당 구간 데이터가 없으면 있는 구간 전체 평균으로 대체
+// (최댓값/최솟값으로 대체하면 그 자체가 또 다른 '유리한 값 골라쓰기'가 되므로 평균을 씀)
+function midBandAvg(rows, field) {
+  const mid = rows.filter(r => r.concurrency >= 5 && r.concurrency <= 10 && typeof r[field] === 'number');
+  if (mid.length) return mid.reduce((s, r) => s + r[field], 0) / mid.length;
+  const all = rows.filter(r => typeof r[field] === 'number');
+  return all.length ? all.reduce((s, r) => s + r[field], 0) / all.length : 0;
+}
+
+function realisticThroughput(rows) { return midBandAvg(rows, 'aggregate_tok_per_sec'); }
+
+// 처리량 ÷ TTFT로 종합한 효율성 점수 — 처리량이 높을수록, 첫 응답이 빠를수록 점수가 커짐.
+// 처리량만 보면 "TTFT는 느린데 처리량만 높은" 장비가 유리해지는 문제를 보완
+function efficiencyScore(rows) {
+  const ttft = midBandAvg(rows, 'p50_ttft');
+  return ttft > 0 ? realisticThroughput(rows) / ttft : 0;
 }
 
 function renderPricePanel() {
   const panel = document.getElementById('pricePanel');
-  const priced = datasets.filter(d => typeof d.price_krw === 'number' && d.price_krw > 0);
+  // 가격 입력 + 에러율 5% 이하(채택 판단 기준과 동일)인 장비만 가성비 비교 대상
+  const priced = datasets.filter(d =>
+    typeof d.price_krw === 'number' && d.price_krw > 0 &&
+    d.rows.every(r => (r.error_rate ?? 100) <= 5.0));
   if (priced.length < 2) { panel.style.display = 'none'; return; }
   panel.style.display = 'block';
 
   const items = priced.map(d => {
     const tok = realisticThroughput(d.rows);
-    const perManwon = tok / (d.price_krw / 10000);
-    return { label: d.label, spec: d.spec || '', price: d.price_krw, tok, perManwon };
+    const score = efficiencyScore(d.rows);
+    const perManwon = score / (d.price_krw / 10000);
+    return { label: d.label, spec: d.spec || '', price: d.price_krw, tok, score, perManwon };
   }).sort((a, b) => b.perManwon - a.perManwon);
 
   const rows = items.map((it, i) => `
@@ -867,7 +881,8 @@ function renderPricePanel() {
       <td>${it.spec || '-'}</td>
       <td>${it.price.toLocaleString()}원</td>
       <td>${it.tok.toFixed(1)}</td>
-      <td class="${i === 0 ? 'win-cell' : ''}">${it.perManwon.toFixed(2)}</td>
+      <td>${it.score.toFixed(2)}</td>
+      <td class="${i === 0 ? 'win-cell' : ''}">${it.perManwon.toFixed(3)}</td>
     </tr>`).join('');
 
   panel.innerHTML = `
@@ -875,11 +890,11 @@ function renderPricePanel() {
     <div class="compare-headline">
       <span class="crown">🏆</span>
       <b>${items[0].label} 가성비 우세</b>
-      <span class="sub">(만원당 ${items[0].perManwon.toFixed(2)} tok/s — 동시 5~10명 실사용 구간 평균 기준)</span>
+      <span class="sub">(만원당 효율점수 ${items[0].perManwon.toFixed(3)} — 동시 5~10명 구간의 처리량÷TTFT 기준. 에러율 5% 초과 장비는 제외)</span>
     </div>
     <div class="table-wrap">
       <table class="compare-table">
-        <thead><tr><th>장비</th><th>사양</th><th>구매가</th><th>실사용 처리량(동시5~10, tok/s)</th><th>만원당 tok/s</th></tr></thead>
+        <thead><tr><th>장비</th><th>사양</th><th>구매가</th><th>실사용 처리량(tok/s)</th><th>효율점수(처리량÷TTFT)</th><th>만원당 효율점수</th></tr></thead>
         <tbody>${rows}</tbody>
       </table>
     </div>`;
@@ -1232,29 +1247,50 @@ def compare_devices(datasets: list) -> dict:
     return {"wins": wins, "rows": rows}
 
 
-def _realistic_throughput(rows: list) -> float:
-    """채택 판단 기준과 같은 '동시 5~10명' 구간 평균을 실사용 처리량으로 사용.
-    특정 동시성에서 우연히 튄 최댓값 하나로 가성비가 왜곡되는 것을 피하기 위함."""
-    mid = [r["aggregate_tok_per_sec"] for r in rows
+def _mid_band_avg(rows: list, field: str) -> float:
+    """채택 판단 기준과 같은 '동시 5~10명' 구간 평균. 특정 동시성에서 우연히 튄 값 하나로
+    지표가 왜곡되는 것을 피하기 위함. 해당 구간 데이터가 없으면 있는 구간 전체 평균으로 대체
+    (최댓값/최솟값으로 대체하면 그 자체가 또 하나의 '유리한 값 골라쓰기'가 되므로 평균을 씀)."""
+    mid = [r[field] for r in rows
            if isinstance(r.get("concurrency"), (int, float)) and 5 <= r["concurrency"] <= 10
-           and isinstance(r.get("aggregate_tok_per_sec"), (int, float))]
+           and isinstance(r.get(field), (int, float))]
     if mid:
         return sum(mid) / len(mid)
-    all_vals = [r.get("aggregate_tok_per_sec", 0) for r in rows if isinstance(r.get("aggregate_tok_per_sec"), (int, float))]
-    return max(all_vals) if all_vals else 0.0
+    all_vals = [r[field] for r in rows if isinstance(r.get(field), (int, float))]
+    return sum(all_vals) / len(all_vals) if all_vals else 0.0
+
+
+def _realistic_throughput(rows: list) -> float:
+    return _mid_band_avg(rows, "aggregate_tok_per_sec")
+
+
+def _efficiency_score(rows: list) -> float:
+    """처리량 ÷ TTFT로 종합한 효율성 점수 — 처리량이 높을수록, 첫 응답이 빠를수록 점수가 커짐.
+    처리량만 보면 'TTFT는 느린데 처리량만 높은' 장비가 유리해지는 문제를 보완."""
+    ttft = _mid_band_avg(rows, "p50_ttft")
+    if ttft <= 0:
+        return 0.0
+    return _realistic_throughput(rows) / ttft
 
 
 def compute_price_efficiency(datasets: list) -> list:
-    """가격이 입력된 장비가 2개 이상일 때, 만원당 tok/s(가성비) 기준으로 정렬한 목록을 만듦"""
-    priced = [ds for ds in datasets if isinstance(ds.get("price_krw"), (int, float)) and ds["price_krw"] > 0]
+    """가격이 입력되고 에러율 기준(≤5%, 채택 판단 기준과 동일)을 통과한 장비가 2개 이상일 때,
+    만원당 효율성 점수(처리량÷TTFT) 기준으로 정렬한 목록을 만듦."""
+    def error_ok(ds):
+        return all((r.get("error_rate", 100) or 0) <= 5.0 for r in ds["rows"])
+
+    priced = [ds for ds in datasets
+              if isinstance(ds.get("price_krw"), (int, float)) and ds["price_krw"] > 0 and error_ok(ds)]
     if len(priced) < 2:
         return []
     items = []
     for ds in priced:
         tok = _realistic_throughput(ds["rows"])
+        score = _efficiency_score(ds["rows"])
         items.append({
             "label": ds["label"], "spec": ds.get("spec", ""), "price": ds["price_krw"],
-            "tok": round(tok, 1), "per_manwon": round(tok / (ds["price_krw"] / 10000), 2),
+            "tok": round(tok, 1), "score": round(score, 2),
+            "per_manwon": round(score / (ds["price_krw"] / 10000), 3),
         })
     items.sort(key=lambda it: it["per_manwon"], reverse=True)
     return items
@@ -1433,15 +1469,16 @@ def generate_pdf_report(results_dir: str) -> str:
                 story.append(Paragraph("가격 대비 성능", styles["h2"]))
                 story.append(Paragraph(
                     f"{price_items[0]['label']} 가성비 우세 "
-                    f"(만원당 {price_items[0]['per_manwon']} tok/s — 동시 5~10명 실사용 구간 평균 기준)",
+                    f"(만원당 효율점수 {price_items[0]['per_manwon']} — 동시 5~10명 실사용 구간의 처리량÷TTFT 기준. "
+                    "에러율 5% 초과 장비는 비교에서 제외됨)",
                     styles["verdict_ok"]))
                 price_header = [Paragraph(h, header_style) for h in
-                                ["장비", "사양", "구매가", "실사용 처리량(동시5~10, tok/s)", "만원당 tok/s"]]
+                                ["장비", "사양", "구매가", "실사용 처리량(tok/s)", "효율점수(처리량÷TTFT)", "만원당 효율점수"]]
                 price_data = [price_header] + [
-                    [it["label"], it["spec"] or "-", f"{it['price']:,.0f}원", it["tok"], it["per_manwon"]]
+                    [it["label"], it["spec"] or "-", f"{it['price']:,.0f}원", it["tok"], it["score"], it["per_manwon"]]
                     for it in price_items
                 ]
-                price_table = Table(price_data, colWidths=[55 * mm, 65 * mm, 35 * mm, 55 * mm, 40 * mm])
+                price_table = Table(price_data, colWidths=[45 * mm, 55 * mm, 30 * mm, 40 * mm, 45 * mm, 40 * mm])
                 price_style = [
                     ("FONTNAME", (0, 0), (-1, -1), PDF_FONT),
                     ("FONTSIZE", (0, 0), (-1, -1), 8.5),
@@ -1450,8 +1487,8 @@ def generate_pdf_report(results_dir: str) -> str:
                     ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cccccc")),
                     ("ALIGN", (0, 0), (-1, -1), "CENTER"),
                     ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f5f5f5")]),
-                    ("TEXTCOLOR", (4, 1), (4, 1), colors.HexColor("#1a7f37")),
-                    ("FONTNAME", (4, 1), (4, 1), PDF_FONT_BOLD),
+                    ("TEXTCOLOR", (5, 1), (5, 1), colors.HexColor("#1a7f37")),
+                    ("FONTNAME", (5, 1), (5, 1), PDF_FONT_BOLD),
                 ]
                 price_table.setStyle(TableStyle(price_style))
                 story.append(price_table)
