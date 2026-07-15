@@ -1330,6 +1330,56 @@ def compute_price_efficiency(datasets: list) -> list:
     return items
 
 
+def build_final_verdict(datasets: list, wins: dict, price_items: list) -> list:
+    """장비 비교(승수)·가격 대비 성능·불안정한 결과(고동시성 에러율)를 종합해 사람이 읽을 수 있는
+    결론 문장 목록을 만든다. 데이터가 실제로 뒷받침하는 만큼만 단정적으로 말하고,
+    가격이 없어 판단 불가능한 부분은 그렇다고 명시한다."""
+    if len(datasets) < 2:
+        return []
+
+    lines = []
+    ranked_perf = sorted(wins.items(), key=lambda kv: kv[1], reverse=True)
+    perf_winner, perf_wins = ranked_perf[0]
+    perf_tie = len(ranked_perf) > 1 and ranked_perf[0][1] == ranked_perf[1][1]
+
+    # 고동시성(5~10명)에서 에러율이 튀는 장비는 "성능이 좋다"고 결론 내려도 실사용 부적합이므로 별도 경고
+    unreliable = []
+    for ds in datasets:
+        bad = [r for r in ds["rows"] if isinstance(r.get("concurrency"), (int, float)) and r["concurrency"] >= 5
+               and isinstance(r.get("error_rate"), (int, float)) and r["error_rate"] > 5]
+        if bad:
+            worst = max(bad, key=lambda r: r["error_rate"])
+            unreliable.append((ds["label"], worst["concurrency"], worst["error_rate"]))
+
+    if perf_tie:
+        lines.append("성능 지표만으로는 두 장비가 동률이라 뚜렷한 우세를 가리기 어렵다.")
+    else:
+        lines.append(f"측정된 지표 기준으로는 <b>{perf_winner}</b>가 우세하다 "
+                      f"(지표별 승수 {', '.join(f'{l} {w}승' for l, w in ranked_perf)}).")
+
+    if price_items:
+        top_value = price_items[0]
+        lines.append(f"가격 대비 성능(100달러당 효율점수)으로는 <b>{top_value['label']}</b>가 가장 우세하다 "
+                      f"({top_value['per_100usd']}점/100달러).")
+        if top_value["label"] != perf_winner and not perf_tie:
+            lines.append("성능 1위와 가성비 1위가 다르다 — 예산이 우선이면 가성비 상위 장비를, "
+                          "응답 품질이 우선이면 성능 상위 장비를 선택하는 것이 합리적이다.")
+    else:
+        priced_count = sum(1 for ds in datasets if isinstance(ds.get("price_krw"), (int, float)) and ds["price_krw"] > 0)
+        if priced_count < len(datasets):
+            missing = [ds["label"] for ds in datasets
+                       if not (isinstance(ds.get("price_krw"), (int, float)) and ds["price_krw"] > 0)]
+            lines.append(f"가격이 입력되지 않은 장비가 있어({', '.join(missing)}) 가격 대비 성능은 아직 판단할 수 없다. "
+                          "가격까지 입력하면 최종 가성비 결론이 갱신된다.")
+
+    for label, c, err in unreliable:
+        lines.append(f"⚠ <b>{label}</b>는 동시 {int(c)}명 구간에서 에러율 {err}%로 급등해 실사용에는 적합하지 않다 — "
+                      "위 성능 우세 판정과 별개로, 이 장비/설정을 그대로 도입하는 것은 권장하지 않는다 "
+                      "(서버 쪽 동시 처리 설정 재점검 필요).")
+
+    return lines
+
+
 def _generate_chart_image(datasets: list, out_path: str) -> str:
     """대시보드와 같은 팔레트로 TTFT·처리량·안정성·에러율 4개 그래프를 그려 하나의 PNG로 저장.
     선이 여러 개일 때 어떤 게 어떤 장비인지 구분되도록 장비마다 고정된 색 + 범례를 붙인다."""
@@ -1526,6 +1576,25 @@ def generate_pdf_report(results_dir: str) -> str:
                 ]
                 price_table.setStyle(TableStyle(price_style))
                 story.append(price_table)
+                story.append(Spacer(1, 10 * mm))
+
+            verdict_lines = build_final_verdict(datasets, cmp["wins"], price_items)
+            if verdict_lines:
+                story.append(Paragraph("🏆 최종 결론", styles["h2"]))
+                verdict_body_style = ParagraphStyle("finalVerdict", fontName=PDF_FONT, fontSize=10.5, leading=16)
+                verdict_box = Table(
+                    [[Paragraph("<br/><br/>".join(verdict_lines), verdict_body_style)]],
+                    colWidths=[269 * mm],
+                )
+                verdict_box.setStyle(TableStyle([
+                    ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f5f5f0")),
+                    ("BOX", (0, 0), (-1, -1), 0.75, colors.HexColor("#c98500")),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 12),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 12),
+                    ("TOPPADDING", (0, 0), (-1, -1), 10),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 10),
+                ]))
+                story.append(verdict_box)
                 story.append(Spacer(1, 10 * mm))
 
         header = ["동시성", "TTFT p50(s)", "TTFT p95(s)", "TTFT SD", "평균 tok/s", "tok/s SD",
