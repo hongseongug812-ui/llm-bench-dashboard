@@ -385,7 +385,9 @@ def group_repeated_runs(datasets: list, results_dir: str = None) -> list:
         groups[key]["members"].append(ds)
         groups[key]["base_labels"].append(base)
 
-    result = []
+    # 먼저 각 그룹의 entry를 만들고, display_name(장비 이름)이 겹치는 게 있는지는 나중에 한 번에 확인한다
+    # — 같은 장비에서 서로 다른 모델을 테스트하면 장비 이름만으로는 구분이 안 되기 때문
+    pending = []
     for key in order:
         members = groups[key]["members"]
         base_labels = groups[key]["base_labels"]
@@ -395,39 +397,50 @@ def group_repeated_runs(datasets: list, results_dir: str = None) -> list:
         display_name = spec if spec else rep_base
 
         if len(members) == 1:
-            members[0]["base_label"] = rep_base
-            members[0]["member_base_labels"] = list(set(base_labels))
-            if spec:
-                members[0]["label"] = display_name
-            result.append(members[0])
-            continue
+            entry = members[0]
+            entry["base_label"] = rep_base
+            entry["member_base_labels"] = list(set(base_labels))
+        else:
+            all_concurrency = sorted({r.get("concurrency") for ds in members for r in ds["rows"]})
+            rep_rows = []
+            ttft_spreads = []
+            for c in all_concurrency:
+                sample_rows = [next((r for r in ds["rows"] if r.get("concurrency") == c), None) for ds in members]
+                sample_rows = [r for r in sample_rows if r is not None]
+                if not sample_rows:
+                    continue
+                row = {"concurrency": c}
+                fields = [k for k in sample_rows[0].keys() if k != "concurrency"]
+                for field in fields:
+                    vals = [r[field] for r in sample_rows if isinstance(r.get(field), (int, float))]
+                    row[field] = round(statistics.median(vals), 3) if vals else "-"
+                ttft_vals = [r["p50_ttft"] for r in sample_rows if isinstance(r.get("p50_ttft"), (int, float))]
+                if len(ttft_vals) > 1:
+                    ttft_spreads.append(max(ttft_vals) - min(ttft_vals))
+                rep_rows.append(row)
+            entry = {
+                "base_label": rep_base,
+                "member_base_labels": list(set(base_labels)),
+                "rows": rep_rows,
+                "run_count": len(members),
+                "ttft_spread": round(max(ttft_spreads), 3) if ttft_spreads else 0,
+            }
+        pending.append({"entry": entry, "display_name": display_name, "rep_base": rep_base, "has_spec": bool(spec)})
 
-        all_concurrency = sorted({r.get("concurrency") for ds in members for r in ds["rows"]})
-        rep_rows = []
-        ttft_spreads = []
-        for c in all_concurrency:
-            sample_rows = [next((r for r in ds["rows"] if r.get("concurrency") == c), None) for ds in members]
-            sample_rows = [r for r in sample_rows if r is not None]
-            if not sample_rows:
-                continue
-            row = {"concurrency": c}
-            fields = [k for k in sample_rows[0].keys() if k != "concurrency"]
-            for field in fields:
-                vals = [r[field] for r in sample_rows if isinstance(r.get(field), (int, float))]
-                row[field] = round(statistics.median(vals), 3) if vals else "-"
-            ttft_vals = [r["p50_ttft"] for r in sample_rows if isinstance(r.get("p50_ttft"), (int, float))]
-            if len(ttft_vals) > 1:
-                ttft_spreads.append(max(ttft_vals) - min(ttft_vals))
-            rep_rows.append(row)
+    name_counts: dict = {}
+    for p in pending:
+        name_counts[p["display_name"]] = name_counts.get(p["display_name"], 0) + 1
 
-        result.append({
-            "label": f"{display_name} (n={len(members)}, 중앙값)",
-            "base_label": rep_base,
-            "member_base_labels": list(set(base_labels)),
-            "rows": rep_rows,
-            "run_count": len(members),
-            "ttft_spread": round(max(ttft_spreads), 3) if ttft_spreads else 0,
-        })
+    result = []
+    for p in pending:
+        entry, display_name, rep_base = p["entry"], p["display_name"], p["rep_base"]
+        # 사양이 같아서 이름이 겹치는 경우에만 모델명을 덧붙여 구분한다(안 겹치면 장비 이름만 깔끔하게 유지)
+        name = f"{display_name} — {_model_guess(rep_base)}" if name_counts[display_name] > 1 else display_name
+        if entry.get("run_count"):
+            entry["label"] = f"{name} (n={entry['run_count']}, 중앙값)"
+        elif p["has_spec"]:
+            entry["label"] = name
+        result.append(entry)
     return result
 
 
